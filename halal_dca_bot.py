@@ -7,8 +7,8 @@ What this does:
      Binance actually lets you trade.
   2. Pulls current prices + your account balances from Binance.
   3. Works out a simple DCA / rebalance proposal (target-weight based).
-  4. Sends the proposal to you via Telegram and WAITS for your explicit approval
-     before placing any order.
+  4. Emails you the proposal (SMTP) and WAITS for your explicit approval —
+     a reply email containing "yes"/"no" — via IMAP, before placing any order.
   5. Never touches margin/futures/withdrawals. Spot-only, hard dollar caps enforced
      locally as a last line of defense even if your API key were mis-scoped.
 
@@ -30,11 +30,15 @@ IMPORTANT / TODO before this is production-ready
 """
 
 import csv
+import email
+import imaplib
 import json
 import os
+import smtplib
 import sys
 import time
 from decimal import Decimal, ROUND_DOWN
+from email.mime.text import MIMEText
 
 import requests
 
@@ -43,8 +47,15 @@ import requests
 # ---------------------------------------------------------------------------
 BINANCE_API_KEY = os.environ.get("BINANCE_API_KEY", "")
 BINANCE_API_SECRET = os.environ.get("BINANCE_API_SECRET", "")
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+
+SMTP_HOST = os.environ.get("SMTP_HOST", "")
+SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
+SMTP_USER = os.environ.get("SMTP_USER", "")
+SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD", "")
+EMAIL_TO = os.environ.get("EMAIL_TO", "")
+
+IMAP_HOST = os.environ.get("IMAP_HOST", "")
+IMAP_PORT = int(os.environ.get("IMAP_PORT", "993"))
 
 DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
 
@@ -126,35 +137,49 @@ def compute_proposal(watchlist, prices, holdings, contribution):
     return proposal
 
 
-def send_telegram_message(text):
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    resp = requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text}, timeout=15)
-    resp.raise_for_status()
-    return resp.json()
+def send_email_message(subject, body):
+    msg = MIMEText(body)
+    msg["Subject"] = subject
+    msg["From"] = SMTP_USER
+    msg["To"] = EMAIL_TO
+    with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
+        server.starttls()
+        server.login(SMTP_USER, SMTP_PASSWORD)
+        server.sendmail(SMTP_USER, [EMAIL_TO], msg.as_string())
 
 
-def poll_for_approval(prompt_message_id, timeout_seconds):
+def poll_for_approval(subject_token, timeout_seconds):
     """
-    Polls Telegram getUpdates for a reply of 'yes'/'approve' after the proposal
-    message. This is intentionally simple — swap for a webhook if you want
-    something more robust.
+    Polls the IMAP inbox for a reply whose subject contains subject_token
+    (a unique run marker) and whose body starts with yes/approve or
+    no/reject. Intentionally simple — swap for a proper webhook/mail-parsing
+    library if you want something more robust.
     """
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
     deadline = time.time() + timeout_seconds
-    last_update_id = None
     while time.time() < deadline:
-        params = {"timeout": 20}
-        if last_update_id:
-            params["offset"] = last_update_id + 1
-        resp = requests.get(url, params=params, timeout=25).json()
-        for update in resp.get("result", []):
-            last_update_id = update["update_id"]
-            msg = update.get("message", {}).get("text", "").strip().lower()
-            if msg in ("yes", "approve", "confirm"):
-                return True
-            if msg in ("no", "reject", "cancel"):
-                return False
-        time.sleep(3)
+        with imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT) as imap:
+            imap.login(SMTP_USER, SMTP_PASSWORD)
+            imap.select("INBOX")
+            status, data = imap.search(None, "UNSEEN")
+            for num in data[0].split():
+                status, msg_data = imap.fetch(num, "(RFC822)")
+                msg = email.message_from_bytes(msg_data[0][1])
+                if subject_token not in (msg.get("Subject") or ""):
+                    continue
+                body = ""
+                if msg.is_multipart():
+                    for part in msg.walk():
+                        if part.get_content_type() == "text/plain":
+                            body = part.get_payload(decode=True).decode(errors="ignore")
+                            break
+                else:
+                    body = msg.get_payload(decode=True).decode(errors="ignore")
+                reply = body.strip().lower()
+                if reply.startswith(("yes", "approve", "confirm")):
+                    return True
+                if reply.startswith(("no", "reject", "cancel")):
+                    return False
+        time.sleep(15)
     return False  # timed out = no action taken, safest default
 
 
@@ -170,9 +195,13 @@ def place_stock_order(ticker, usd_amount):
 
 
 def main():
-    if not all([BINANCE_API_KEY, BINANCE_API_SECRET, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID]):
+    required = [BINANCE_API_KEY, BINANCE_API_SECRET, SMTP_HOST, SMTP_USER, SMTP_PASSWORD, EMAIL_TO, IMAP_HOST]
+    if not all(required):
         print("Missing required environment variables/secrets. Aborting.", file=sys.stderr)
         sys.exit(1)
+
+    run_token = f"DCA-{int(time.time())}"
+    subject = f"Halal DCA proposal [{run_token}]"
 
     watchlist = load_watchlist(UNIVERSE_FILE)
     prices = get_current_prices([w["ticker"] for w in watchlist])
@@ -180,30 +209,30 @@ def main():
     proposal = compute_proposal(watchlist, prices, holdings, MONTHLY_CONTRIBUTION_USD)
 
     if not proposal:
-        send_telegram_message("Halal DCA bot: nothing to propose this run (all positions at target).")
+        send_email_message(subject, "Halal DCA bot: nothing to propose this run (all positions at target).")
         return
 
     lines = [f"{p['ticker']}: ~${p['usd']} (~{p['approx_shares']} shares)" for p in proposal]
-    message = (
+    body = (
         "Halal DCA bot — proposed buys this cycle:\n"
         + "\n".join(lines)
         + f"\n\nTotal: ${sum(p['usd'] for p in proposal)}"
-        + "\n\nReply 'yes' to approve, 'no' to skip this cycle."
+        + "\n\nReply to this email starting with 'yes' to approve, 'no' to skip this cycle."
     )
-    send_telegram_message(message)
+    send_email_message(subject, body)
 
     if DRY_RUN:
         print("DRY_RUN=true — stopping after proposal, no approval polling, no orders placed.")
         return
 
-    approved = poll_for_approval(None, APPROVAL_TIMEOUT_SECONDS)
+    approved = poll_for_approval(run_token, APPROVAL_TIMEOUT_SECONDS)
     if not approved:
-        send_telegram_message("No approval received in time (or rejected) — skipping this cycle.")
+        send_email_message(subject, "No approval received in time (or rejected) — skipping this cycle.")
         return
 
     for p in proposal:
         place_stock_order(p["ticker"], p["usd"])
-    send_telegram_message("Orders placed. Review your Binance account to confirm fills.")
+    send_email_message(subject, "Orders placed. Review your Binance account to confirm fills.")
 
 
 if __name__ == "__main__":

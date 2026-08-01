@@ -38,10 +38,12 @@ the crypto spot API shape applies. Test with tiny dollar amounts before trusting
 ## Remaining steps (this is where Claude Code picks up)
 3. Create a private GitHub repo, add these files, move the workflow YAML into
    `.github/workflows/`, `git init` / push.
-4. Create a Telegram bot via @BotFather, get the chat ID.
+4. Set up an app password for your email provider (e.g. Gmail App Password) for SMTP send
+   + IMAP poll of yes/no replies.
 5. Generate a Binance API key scoped to spot-trading only (no withdrawals, IP-restricted
-   if possible). Add `BINANCE_API_KEY`, `BINANCE_API_SECRET`, `TELEGRAM_BOT_TOKEN`,
-   `TELEGRAM_CHAT_ID` as GitHub Actions encrypted secrets — never commit them.
+   if possible). Add `BINANCE_API_KEY`, `BINANCE_API_SECRET`, `SMTP_HOST`, `SMTP_USER`,
+   `SMTP_PASSWORD`, `EMAIL_TO`, `IMAP_HOST` as GitHub Actions encrypted secrets — never
+   commit them.
 6. Fill in the three stubbed functions using confirmed Binance API docs.
 7. Dry-run (`DRY_RUN=true`) for a few cycles, inspect proposals, only then flip to live.
 
