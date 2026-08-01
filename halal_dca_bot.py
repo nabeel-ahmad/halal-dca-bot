@@ -19,18 +19,19 @@ SECURITY
     statements that dump them, and don't paste them into chat with an AI assistant.
   - Run with DRY_RUN=true for your first several cycles.
 
-IMPORTANT / TODO before this is production-ready
-  - Binance's stock-trading feature launched in 2026 and is very new. The exact
-    REST endpoint(s) for placing a STOCK order (as opposed to a crypto spot order)
-    were not confirmed at the time this script was written. Check
-    https://developers.binance.com/en for the current "Stocks" API section and
-    fill in `place_stock_order()` accordingly before relying on this for real
-    trades. Placeholder logic below assumes a Binance-compatible REST shape;
-    verify field names against the official docs first.
+IMPORTANT
+  - Implemented against Binance's Stocks Trading REST API (`/sapi/v1/equity/*`,
+    launched 2026-07), per https://developers.binance.com/en/docs/catalog/advanced-trading-stocks-trading/api/rest-api.
+    There is no dedicated positions/balance endpoint yet — get_account_holdings()
+    derives net share counts from summed trade history instead. Re-verify against
+    current docs before trusting this with real money; Binance may add a direct
+    positions endpoint later.
 """
 
 import csv
 import email
+import hashlib
+import hmac
 import imaplib
 import json
 import os
@@ -67,7 +68,24 @@ MONTHLY_CONTRIBUTION_USD = Decimal(os.environ.get("MONTHLY_CONTRIBUTION_USD", "5
 UNIVERSE_FILE = os.environ.get("UNIVERSE_FILE", "halal_universe.csv")
 APPROVAL_TIMEOUT_SECONDS = int(os.environ.get("APPROVAL_TIMEOUT_SECONDS", "1800"))
 
-BINANCE_BASE_URL = "https://api.binance.com"  # confirm this is correct host for stocks product
+BINANCE_BASE_URL = "https://api.binance.com"
+
+# Binance Stocks Trading (launched 2026-07) has no dedicated positions/balance
+# endpoint — holdings are derived by summing signed trade history from this
+# cutoff forward. Set well before your first real trade.
+HOLDINGS_HISTORY_START_MS = int(os.environ.get("HOLDINGS_HISTORY_START_MS", "1735689600000"))  # 2025-01-01T00:00:00Z
+
+
+def _binance_signed_request(method, path, params):
+    params = dict(params)
+    params["timestamp"] = int(time.time() * 1000)
+    params.setdefault("recvWindow", 5000)
+    query = "&".join(f"{k}={v}" for k, v in params.items())
+    signature = hmac.new(BINANCE_API_SECRET.encode(), query.encode(), hashlib.sha256).hexdigest()
+    url = f"{BINANCE_BASE_URL}{path}?{query}&signature={signature}"
+    resp = requests.request(method, url, headers={"X-MBX-APIKEY": BINANCE_API_KEY}, timeout=15)
+    resp.raise_for_status()
+    return resp.json()
 
 
 def load_watchlist(path):
@@ -86,20 +104,49 @@ def load_watchlist(path):
 
 
 def get_current_prices(tickers):
-    """
-    TODO: replace with the confirmed Binance stocks price endpoint.
-    Returning a stub here so the rest of the pipeline is testable end-to-end
-    before you've wired up the real API call.
-    """
-    raise NotImplementedError(
-        "Fill in get_current_prices() using the official Binance stocks API "
-        "reference once you've confirmed the endpoint at developers.binance.com"
-    )
+    """Latest bid/ask quote per ticker (MARKET_DATA, API key only, no signature)."""
+    prices = {}
+    for ticker in tickers:
+        resp = requests.get(
+            f"{BINANCE_BASE_URL}/sapi/v1/equity/market/quote",
+            headers={"X-MBX-APIKEY": BINANCE_API_KEY},
+            params={"symbol": ticker},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        if not data:
+            raise RuntimeError(f"No quote available for {ticker}")
+        prices[ticker] = (Decimal(data["bidPrice"]) + Decimal(data["askPrice"])) / 2
+    return prices
 
 
 def get_account_holdings():
-    """TODO: same as above — wire up to the real account/positions endpoint."""
-    raise NotImplementedError("Fill in get_account_holdings()")
+    """
+    Binance's Stocks Trading API has no dedicated positions/balance endpoint
+    (as of the 2026-07 launch) — holdings are derived by summing signed BUY/SELL
+    quantities from paginated trade history. Revisit this if Binance adds a
+    direct positions endpoint later.
+    """
+    holdings = {}
+    page = 1
+    now_ms = int(time.time() * 1000)
+    while True:
+        data = _binance_signed_request("GET", "/sapi/v1/equity/trade/history", {
+            "startTime": HOLDINGS_HISTORY_START_MS,
+            "endTime": now_ms,
+            "current": page,
+            "size": 100,
+        })
+        rows = data.get("rows", [])
+        for row in rows:
+            qty = Decimal(row["qty"])
+            delta = qty if row["side"] == "BUY" else -qty
+            holdings[row["symbol"]] = holdings.get(row["symbol"], Decimal("0")) + delta
+        if not rows or page * data.get("size", 100) >= data.get("total", 0):
+            break
+        page += 1
+    return holdings
 
 
 def compute_proposal(watchlist, prices, holdings, contribution):
@@ -184,14 +231,16 @@ def poll_for_approval(subject_token, timeout_seconds):
 
 
 def place_stock_order(ticker, usd_amount):
-    """
-    TODO: Confirm the real endpoint/payload shape for Binance's stock product
-    before enabling live orders. Do NOT assume this placeholder is correct.
-    """
-    raise NotImplementedError(
-        "Wire this up to the confirmed Binance stocks order endpoint. "
-        "Test thoroughly with tiny dollar amounts before trusting it."
-    )
+    """BUY MARKET order sized by notional (USD/USDC amount, fractional shares allowed)."""
+    result = _binance_signed_request("POST", "/sapi/v1/equity/order/place", {
+        "symbol": ticker,
+        "side": "BUY",
+        "orderType": "MARKET",
+        "notional": str(usd_amount),
+    })
+    if result.get("status") != "S":
+        raise RuntimeError(f"Order for {ticker} was not accepted: {result}")
+    return result
 
 
 def main():
