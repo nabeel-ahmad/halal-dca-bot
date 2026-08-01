@@ -33,6 +33,11 @@ jobs:
       - name: Install dependencies
         run: /Users/hk-nabeel/.venvs/halal-dca-bot/bin/pip install --quiet -r requirements.txt
 
+      - name: TEMP - check watchlist tradability
+        env:
+          BINANCE_API_KEY: ${{ secrets.BINANCE_API_KEY }}
+        run: /Users/hk-nabeel/.venvs/halal-dca-bot/bin/python check_universe_tradable.py "AAOI,FSLY,SNDK,ICHR,AEHR"
+
       - name: Run halal DCA bot
         env:
           BINANCE_API_KEY: ${{ secrets.BINANCE_API_KEY }}

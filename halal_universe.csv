@@ -1,5 +1,6 @@
 ticker,target_weight,last_checked_compliant_on,notes
-AAPL,0.25,2026-08-01,PLACEHOLDER - verify current shariah compliance yourself before using
-MSFT,0.25,2026-08-01,PLACEHOLDER - verify current shariah compliance yourself before using
-JNJ,0.25,2026-08-01,PLACEHOLDER - verify current shariah compliance yourself before using
-COST,0.25,2026-08-01,PLACEHOLDER - verify current shariah compliance yourself before using
+AAOI,0.20,,user-provided watchlist
+FSLY,0.20,,user-provided watchlist
+SNDK,0.20,,user-provided watchlist
+ICHR,0.20,,user-provided watchlist
+AEHR,0.20,,user-provided watchlist
