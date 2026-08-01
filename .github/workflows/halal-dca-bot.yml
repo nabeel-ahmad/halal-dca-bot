@@ -1,0 +1,40 @@
+# Runs the bot on the 1st of every month at 09:00 UTC — costs nothing on
+# GitHub's free tier (a single run takes seconds of your 2,000 free
+# minutes/month). Trigger manually any time via the "Run workflow" button too.
+#
+# Before enabling live trading, add these as repo secrets under
+# Settings > Secrets and variables > Actions:
+#   BINANCE_API_KEY, BINANCE_API_SECRET, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+# Keep DRY_RUN=true until you've verified several cycles end-to-end.
+
+name: Halal DCA Bot
+
+on:
+  schedule:
+    - cron: "0 9 1 * *"
+  workflow_dispatch: {}
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run halal DCA bot
+        env:
+          BINANCE_API_KEY: ${{ secrets.BINANCE_API_KEY }}
+          BINANCE_API_SECRET: ${{ secrets.BINANCE_API_SECRET }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          DRY_RUN: "true"           # flip to "false" only once you trust it
+          MAX_ORDER_USD: "200"
+          MAX_TOTAL_USD_PER_RUN: "1000"
+          MONTHLY_CONTRIBUTION_USD: "500"
+        run: python halal_dca_bot.py
