@@ -25,12 +25,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
+      # Self-hosted runner: use the Mac's own Python rather than
+      # actions/setup-python, which assumes GitHub-hosted runners' fixed
+      # /Users/runner toolcache path.
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: python3 -m pip install --quiet -r requirements.txt
 
       - name: Run halal DCA bot
         env:
@@ -45,4 +44,4 @@ jobs:
           MAX_ORDER_USD: "200"
           MAX_TOTAL_USD_PER_RUN: "1000"
           MONTHLY_CONTRIBUTION_USD: "500"
-        run: python halal_dca_bot.py
+        run: python3 halal_dca_bot.py
