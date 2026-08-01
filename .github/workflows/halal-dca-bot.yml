@@ -1,6 +1,10 @@
-# Runs the bot on the 1st of every month at 09:00 UTC — costs nothing on
-# GitHub's free tier (a single run takes seconds of your 2,000 free
-# minutes/month). Trigger manually any time via the "Run workflow" button too.
+# Runs the bot on the 1st of every month at 09:00 UTC. Trigger manually any
+# time via the "Run workflow" button too.
+#
+# Runs on a self-hosted runner (your own Mac) rather than GitHub-hosted
+# runners — Binance blocks requests from GitHub/AWS/Azure datacenter IP
+# ranges with HTTP 451. The runner must be online (Mac powered on, runner
+# service running) at trigger time to pick up the scheduled run.
 #
 # Before enabling live trading, add these as repo secrets under
 # Settings > Secrets and variables > Actions:
@@ -17,7 +21,7 @@ on:
 
 jobs:
   run-bot:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, macOS, ARM64]
     steps:
       - uses: actions/checkout@v4
 
