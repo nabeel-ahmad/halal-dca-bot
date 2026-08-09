@@ -1,0 +1,42 @@
+# Runs every Sunday. Trigger manually any time via the "Run workflow" button.
+#
+# Cron is UTC and ignores DST: "0 5 * * 0" = Sunday 05:00 UTC, which is
+# Sunday 10:00 in Pakistan Standard Time (UTC+5, no DST) — this machine's
+# local timezone. Adjust the cron line if that's ever wrong.
+#
+# Self-hosted runner, same reasons as halal-dca-bot.yml: Binance blocks
+# GitHub-hosted-runner IPs with HTTP 451. The runner must be online (Mac
+# powered on, runner service running) at trigger time — a missed weekly
+# window is more likely than a missed monthly one, so keep the Mac awake
+# Sunday mornings if this starts silently skipping.
+#
+# Read-only — never places orders. Needs these repo secrets (same ones
+# used by halal-dca-bot.yml): BINANCE_API_KEY, BINANCE_API_SECRET,
+# SMTP_HOST, SMTP_USER, SMTP_PASSWORD, EMAIL_TO.
+
+name: Weekly Portfolio Review
+
+on:
+  schedule:
+    - cron: "0 5 * * 0"
+  workflow_dispatch: {}
+
+jobs:
+  review:
+    runs-on: [self-hosted, macOS, ARM64]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: /Users/hk-nabeel/.venvs/halal-dca-bot/bin/pip install --quiet -r requirements.txt
+
+      - name: Run weekly portfolio review
+        env:
+          BINANCE_API_KEY: ${{ secrets.BINANCE_API_KEY }}
+          BINANCE_API_SECRET: ${{ secrets.BINANCE_API_SECRET }}
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+          CONCENTRATION_WARN_PCT: "30"
+        run: /Users/hk-nabeel/.venvs/halal-dca-bot/bin/python weekly_portfolio_review.py
