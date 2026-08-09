@@ -17,7 +17,9 @@ for symbol, qty in holdings.items():
 print()
 print("=== Spot account non-zero balances (/api/v3/account) ===")
 data = _binance_signed_request("GET", "/api/v3/account", {})
-for bal in data.get("balances", []):
+all_balances = data.get("balances", [])
+print(f"(total balance entries returned: {len(all_balances)}; accountType={data.get('accountType')}; permissions={data.get('permissions')})")
+for bal in all_balances:
     free = Decimal(bal["free"])
     locked = Decimal(bal["locked"])
     if free != 0 or locked != 0:
