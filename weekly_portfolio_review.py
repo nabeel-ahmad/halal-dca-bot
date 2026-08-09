@@ -26,10 +26,13 @@ SECURITY: never hardcode credentials. Same env vars as halal_dca_bot.py.
 
 import os
 import re
+import smtplib
 import sys
 import time
 from decimal import Decimal, ROUND_HALF_UP
-from html import unescape
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from html import escape, unescape
 
 import requests
 
@@ -38,6 +41,7 @@ from halal_dca_bot import (
     EMAIL_TO,
     SMTP_HOST,
     SMTP_PASSWORD,
+    SMTP_PORT,
     SMTP_USER,
     UNIVERSE_FILE,
     get_account_holdings,
@@ -118,57 +122,179 @@ def check_compliance(ticker):
     return overall, results
 
 
-def build_report(holdings, prices, watchlist_targets):
+SYMBOL = {COMPLIANT: "✅", NON_COMPLIANT: "❌", UNKNOWN: "⚠️"}
+COLOR = {COMPLIANT: "#1a7f37", NON_COMPLIANT: "#cf222e", UNKNOWN: "#9a6700"}
+BADGE_BG = {COMPLIANT: "#dafbe1", NON_COMPLIANT: "#ffebe9", UNKNOWN: "#fff8c5"}
+
+MANUAL_LINKS = (
+    "https://hyssa.com/en/how-to-start/explore-halal-screened-stocks",
+    "https://www.islamicfinanceguru.com/resources/halal-stocks-screening-guide",
+)
+
+
+def compute_rows(holdings, prices, watchlist_targets):
+    """One pass over holdings: compliance check + weight/target-deviation, in a
+    single structured form both the text and HTML renderers read from."""
     total_value = sum(qty * prices[t] for t, qty in holdings.items())
-    lines = []
-    flagged_compliance = []
-    flagged_concentration = []
-
-    lines.append("=== Sharia compliance re-check ===\n")
-    for ticker in sorted(holdings):
-        overall, sources = check_compliance(ticker)
-        lines.append(f"{ticker}: {overall}")
-        for name, (status, url, detail) in sources.items():
-            lines.append(f"    {name}: {status} ({detail}) — {url}")
-        lines.append(
-            f"    manual cross-check: https://hyssa.com/en/how-to-start/explore-halal-screened-stocks"
-            f" | https://www.islamicfinanceguru.com/resources/halal-stocks-screening-guide"
-        )
-        if overall != COMPLIANT:
-            flagged_compliance.append((ticker, overall))
-        time.sleep(1)  # be polite — one fetch per ticker per week per source
-
-    lines.append("\n=== Position weights & concentration ===\n")
+    rows = []
     for ticker, qty in sorted(holdings.items(), key=lambda kv: -(kv[1] * prices[kv[0]])):
+        overall, sources = check_compliance(ticker)
         value = qty * prices[ticker]
         pct = (value / total_value * 100).quantize(Decimal("0.1"), rounding=ROUND_HALF_UP) if total_value else Decimal("0")
-        line = f"{ticker}: ${value:.2f} ({pct}% of portfolio)"
         target = watchlist_targets.get(ticker)
-        if target is not None:
-            target_pct = (target * 100).quantize(Decimal("0.1"))
-            line += f" — target {target_pct}%, deviation {pct - target_pct:+.1f}pp"
-        lines.append(line)
-        if pct > CONCENTRATION_WARN_PCT:
-            flagged_concentration.append((ticker, pct))
+        target_pct = (target * 100).quantize(Decimal("0.1")) if target is not None else None
+        over_concentrated = pct > CONCENTRATION_WARN_PCT or len(holdings) == 1
+        rows.append({
+            "ticker": ticker,
+            "compliance": overall,
+            "sources": sources,
+            "value": value,
+            "pct": pct if len(holdings) > 1 else Decimal("100"),
+            "target_pct": target_pct,
+            "deviation": (pct - target_pct) if target_pct is not None else None,
+            "over_concentrated": over_concentrated,
+        })
+        time.sleep(1)  # be polite — one fetch per ticker per week per source
+    return rows, total_value
 
-    lines.append(f"\nTotal portfolio value: ${total_value:.2f}")
-    if len(holdings) == 1:
-        flagged_concentration.append((next(iter(holdings)), Decimal("100")))
+
+def render_text(rows, total_value):
+    lines = []
+    flagged_compliance = [r for r in rows if r["compliance"] != COMPLIANT]
+    flagged_concentration = [r for r in rows if r["over_concentrated"]]
 
     summary = []
     if flagged_compliance:
-        summary.append(
-            "COMPLIANCE: " + ", ".join(f"{t} ({s})" for t, s in flagged_compliance)
-        )
+        summary.append("COMPLIANCE: " + ", ".join(f"{r['ticker']} ({r['compliance']})" for r in flagged_compliance))
     if flagged_concentration:
         summary.append(
             f"CONCENTRATION (>{CONCENTRATION_WARN_PCT}% or single-holding): "
-            + ", ".join(f"{t} at {p}%" for t, p in flagged_concentration)
+            + ", ".join(f"{r['ticker']} at {r['pct']}%" for r in flagged_concentration)
         )
     if not summary:
         summary.append("Nothing flagged this week.")
+    lines.append("\n".join(summary))
 
-    return "\n".join(summary) + "\n\n" + "\n".join(lines)
+    lines.append("\n=== Sharia compliance re-check ===\n")
+    for r in rows:
+        lines.append(f"{r['ticker']}: {r['compliance']}")
+        for name, (status, url, detail) in r["sources"].items():
+            lines.append(f"    {name}: {status} ({detail}) — {url}")
+        lines.append("    manual cross-check: " + " | ".join(MANUAL_LINKS))
+
+    lines.append("\n=== Position weights & concentration ===\n")
+    for r in rows:
+        line = f"{r['ticker']}: ${r['value']:.2f} ({r['pct']}% of portfolio)"
+        if r["target_pct"] is not None:
+            line += f" — target {r['target_pct']}%, deviation {r['deviation']:+.1f}pp"
+        lines.append(line)
+    lines.append(f"\nTotal portfolio value: ${total_value:.2f}")
+
+    return "\n".join(lines)
+
+
+def render_html(rows, total_value):
+    flagged_compliance = [r for r in rows if r["compliance"] != COMPLIANT]
+    flagged_concentration = [r for r in rows if r["over_concentrated"]]
+
+    def badge(status):
+        return (
+            f'<span style="background:{BADGE_BG[status]};color:{COLOR[status]};'
+            f'border-radius:4px;padding:2px 8px;font-weight:600;white-space:nowrap;">'
+            f'{SYMBOL[status]} {escape(status.replace("_", " "))}</span>'
+        )
+
+    summary_parts = []
+    if flagged_compliance:
+        summary_parts.append(
+            "<b>Compliance:</b> " + ", ".join(f"{escape(r['ticker'])} {badge(r['compliance'])}" for r in flagged_compliance)
+        )
+    if flagged_concentration:
+        summary_parts.append(
+            f"<b>Concentration</b> (&gt;{CONCENTRATION_WARN_PCT}% or single-holding): "
+            + ", ".join(f"\U0001f534 {escape(r['ticker'])} at {r['pct']}%" for r in flagged_concentration)
+        )
+    summary_html = "<br>".join(summary_parts) if summary_parts else "✅ Nothing flagged this week."
+
+    def compliance_row(r):
+        sources_html = "<br>".join(
+            f'<a href="{url}" style="color:#57606a;text-decoration:none;">{escape(name)}: {SYMBOL[status]} {escape(detail)}</a>'
+            for name, (status, url, detail) in r["sources"].items()
+        )
+        return (
+            "<tr>"
+            f'<td style="padding:8px;border-bottom:1px solid #d0d7de;font-weight:600;">{escape(r["ticker"])}</td>'
+            f'<td style="padding:8px;border-bottom:1px solid #d0d7de;">{badge(r["compliance"])}</td>'
+            f'<td style="padding:8px;border-bottom:1px solid #d0d7de;font-size:12px;">{sources_html}</td>'
+            "</tr>"
+        )
+
+    def weight_row(r):
+        dev_cell = ""
+        if r["target_pct"] is not None:
+            dev_color = "#cf222e" if abs(r["deviation"]) >= 5 else "#57606a"
+            dev_cell = f'<span style="color:{dev_color};">{r["deviation"]:+.1f}pp</span> (target {r["target_pct"]}%)'
+        conc_symbol = "\U0001f534" if r["over_concentrated"] else "\U0001f7e2"
+        return (
+            "<tr>"
+            f'<td style="padding:8px;border-bottom:1px solid #d0d7de;font-weight:600;">{escape(r["ticker"])}</td>'
+            f'<td style="padding:8px;border-bottom:1px solid #d0d7de;">${r["value"]:.2f}</td>'
+            f'<td style="padding:8px;border-bottom:1px solid #d0d7de;">{conc_symbol} {r["pct"]}%</td>'
+            f'<td style="padding:8px;border-bottom:1px solid #d0d7de;">{dev_cell}</td>'
+            "</tr>"
+        )
+
+    manual_links_html = " | ".join(f'<a href="{u}" style="color:#57606a;">{escape(u)}</a>' for u in MANUAL_LINKS)
+
+    return f"""\
+<div style="font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;color:#1f2328;background:#ffffff;max-width:680px;padding:16px;">
+  <p style="font-size:15px;">{summary_html}</p>
+
+  <h3 style="margin-top:24px;">Sharia compliance re-check</h3>
+  <table style="width:100%;border-collapse:collapse;font-size:14px;">
+    <thead>
+      <tr style="background:#f6f8fa;text-align:left;">
+        <th style="padding:8px;border-bottom:2px solid #d0d7de;">Ticker</th>
+        <th style="padding:8px;border-bottom:2px solid #d0d7de;">Overall</th>
+        <th style="padding:8px;border-bottom:2px solid #d0d7de;">Sources</th>
+      </tr>
+    </thead>
+    <tbody>
+      {"".join(compliance_row(r) for r in rows)}
+    </tbody>
+  </table>
+  <p style="font-size:12px;color:#57606a;">Manual cross-check (not auto-checked): {manual_links_html}</p>
+
+  <h3 style="margin-top:24px;">Position weights &amp; concentration</h3>
+  <table style="width:100%;border-collapse:collapse;font-size:14px;">
+    <thead>
+      <tr style="background:#f6f8fa;text-align:left;">
+        <th style="padding:8px;border-bottom:2px solid #d0d7de;">Ticker</th>
+        <th style="padding:8px;border-bottom:2px solid #d0d7de;">Value</th>
+        <th style="padding:8px;border-bottom:2px solid #d0d7de;">% of portfolio</th>
+        <th style="padding:8px;border-bottom:2px solid #d0d7de;">vs. target</th>
+      </tr>
+    </thead>
+    <tbody>
+      {"".join(weight_row(r) for r in rows)}
+    </tbody>
+  </table>
+  <p style="font-size:13px;color:#57606a;">Total portfolio value: <b>${total_value:.2f}</b></p>
+</div>
+"""
+
+
+def send_report_email(subject, text_body, html_body):
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = subject
+    msg["From"] = SMTP_USER
+    msg["To"] = EMAIL_TO
+    msg.attach(MIMEText(text_body, "plain"))
+    msg.attach(MIMEText(html_body, "html"))
+    with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
+        server.starttls()
+        server.login(SMTP_USER, SMTP_PASSWORD)
+        server.sendmail(SMTP_USER, [EMAIL_TO], msg.as_string())
 
 
 def main():
@@ -194,8 +320,10 @@ def main():
     except (FileNotFoundError, ValueError) as e:
         print(f"Note: couldn't load {UNIVERSE_FILE} for target-weight comparison: {e}", file=sys.stderr)
 
-    body = build_report(holdings, prices, watchlist_targets)
-    send_email_message("Weekly portfolio review", body)
+    rows, total_value = compute_rows(holdings, prices, watchlist_targets)
+    text_body = render_text(rows, total_value)
+    html_body = render_html(rows, total_value)
+    send_report_email("Weekly portfolio review", text_body, html_body)
 
 
 if __name__ == "__main__":
