@@ -44,13 +44,18 @@ from halal_dca_bot import (
     SMTP_PORT,
     SMTP_USER,
     UNIVERSE_FILE,
+    _binance_signed_request,
     get_account_holdings,
     get_current_prices,
     load_watchlist,
     send_email_message,
 )
+from musaffa_recommendations import get_etf_candidates, get_stock_candidates
 
 CONCENTRATION_WARN_PCT = Decimal(os.environ.get("CONCENTRATION_WARN_PCT", "30"))
+CASH_RESERVE_TARGET_USD = Decimal(os.environ.get("CASH_RESERVE_TARGET_USD", "500"))
+NUM_STOCK_PICKS = int(os.environ.get("NUM_STOCK_PICKS", "7"))
+NUM_ETF_PICKS = int(os.environ.get("NUM_ETF_PICKS", "3"))
 HTTP_TIMEOUT = 15
 USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -284,6 +289,130 @@ def render_html(rows, total_value):
 """
 
 
+def get_stablecoin_balance():
+    """Free USDT + USDC on the spot account — the 'idle cash' this review
+    tries to keep under CASH_RESERVE_TARGET_USD."""
+    data = _binance_signed_request("GET", "/api/v3/account", {})
+    total = Decimal("0")
+    for bal in data.get("balances", []):
+        if bal["asset"] in ("USDT", "USDC"):
+            total += Decimal(bal["free"])
+    return total
+
+
+def compute_recommendations(stablecoin_balance):
+    """Mechanical allocation: pull candidates matching the exact Musaffa filter
+    you specified (Sharia-compliant, rating A/A+, analyst Buy/Strong Buy for
+    stocks; sorted by number of holdings for ETFs), then split whatever idle
+    cash sits above CASH_RESERVE_TARGET_USD equally across the picks. This
+    doesn't pick stocks by growth judgment — it reports what your own filter
+    returns and does the arithmetic to keep cash under your target."""
+    stocks = get_stock_candidates(NUM_STOCK_PICKS)
+    etfs = get_etf_candidates(NUM_ETF_PICKS)
+    picks = [dict(p, asset_type="stock") for p in stocks] + [dict(p, asset_type="etf") for p in etfs]
+
+    investable = max(Decimal("0"), stablecoin_balance - CASH_RESERVE_TARGET_USD)
+    per_asset = (investable / len(picks)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP) if picks else Decimal("0")
+    for p in picks:
+        p["suggested_usd"] = per_asset
+
+    return {
+        "picks": picks,
+        "stablecoin_balance": stablecoin_balance,
+        "investable": investable,
+        "per_asset": per_asset,
+    }
+
+
+def render_recommendations_text(rec):
+    lines = ["\n=== This week's halal candidates (new money) ===\n"]
+    lines.append(
+        f"USDT+USDC balance: ${rec['stablecoin_balance']:.2f} | "
+        f"cash reserve target: ${CASH_RESERVE_TARGET_USD} | "
+        f"investable: ${rec['investable']:.2f}"
+    )
+    if rec["investable"] == 0:
+        lines.append("Nothing above the cash reserve target to deploy this week — candidates listed for reference only.")
+    lines.append("")
+    for p in rec["picks"]:
+        if p["asset_type"] == "stock":
+            lines.append(
+                f"[STOCK] {p['ticker']} — {p['name']} | analyst rating: {p['analyst_rating']} | "
+                f"sector: {p['sector']} | mkt cap: {p['market_cap']} | suggested: ${p['suggested_usd']:.2f}"
+            )
+        else:
+            lines.append(
+                f"[ETF]   {p['ticker']} — {p['name']} | holdings: {p['num_holdings']} | "
+                f"segment: {p['segment']} | suggested: ${p['suggested_usd']:.2f}"
+            )
+    lines.append(
+        "\nFilter applied (Musaffa screener): Sharia-compliant, Musaffa rating A/A+, "
+        "analyst consensus Buy/Strong Buy (stocks) — sorted by number of holdings (ETFs)."
+    )
+    lines.append(
+        "Binance has no API for marking favorites — favorite these manually in the app: "
+        + ", ".join(p["ticker"] for p in rec["picks"])
+    )
+    return "\n".join(lines)
+
+
+def render_recommendations_html(rec):
+    def pick_row(p):
+        if p["asset_type"] == "stock":
+            detail = f"{escape(p['sector'])} · {escape(p['market_cap'])} · analyst: <b>{escape(p['analyst_rating'])}</b>"
+            type_badge = '<span style="background:#ddf4ff;color:#0969da;border-radius:4px;padding:2px 6px;font-size:12px;">STOCK</span>'
+        else:
+            detail = f"{escape(p['segment'])} · {escape(p['num_holdings'])} holdings"
+            type_badge = '<span style="background:#fbefff;color:#8250df;border-radius:4px;padding:2px 6px;font-size:12px;">ETF</span>'
+        return (
+            "<tr>"
+            f'<td style="padding:8px;border-bottom:1px solid #d0d7de;font-weight:600;">{escape(p["ticker"])}</td>'
+            f'<td style="padding:8px;border-bottom:1px solid #d0d7de;">{type_badge}</td>'
+            f'<td style="padding:8px;border-bottom:1px solid #d0d7de;font-size:12px;">{escape(p["name"])}<br>{detail}</td>'
+            f'<td style="padding:8px;border-bottom:1px solid #d0d7de;text-align:right;">${p["suggested_usd"]:.2f}</td>'
+            "</tr>"
+        )
+
+    note = ""
+    if rec["investable"] == 0:
+        note = '<p style="font-size:13px;color:#9a6700;">Nothing above the cash reserve target to deploy this week — candidates listed for reference only.</p>'
+
+    favorite_list = ", ".join(escape(p["ticker"]) for p in rec["picks"])
+
+    return f"""\
+<div style="font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;color:#1f2328;background:#ffffff;max-width:680px;padding:16px;">
+  <h3 style="margin-top:0;">This week's halal candidates (new money)</h3>
+  <p style="font-size:13px;color:#57606a;">
+    USDT+USDC balance: <b>${rec['stablecoin_balance']:.2f}</b> &nbsp;|&nbsp;
+    cash reserve target: <b>${CASH_RESERVE_TARGET_USD}</b> &nbsp;|&nbsp;
+    investable: <b>${rec['investable']:.2f}</b>
+  </p>
+  {note}
+  <table style="width:100%;border-collapse:collapse;font-size:14px;">
+    <thead>
+      <tr style="background:#f6f8fa;text-align:left;">
+        <th style="padding:8px;border-bottom:2px solid #d0d7de;">Ticker</th>
+        <th style="padding:8px;border-bottom:2px solid #d0d7de;">Type</th>
+        <th style="padding:8px;border-bottom:2px solid #d0d7de;">Details</th>
+        <th style="padding:8px;border-bottom:2px solid #d0d7de;text-align:right;">Suggested</th>
+      </tr>
+    </thead>
+    <tbody>
+      {"".join(pick_row(p) for p in rec["picks"])}
+    </tbody>
+  </table>
+  <p style="font-size:12px;color:#57606a;">
+    Filter applied (Musaffa screener): Sharia-compliant, Musaffa rating A/A+, analyst consensus
+    Buy/Strong Buy (stocks) &mdash; sorted by number of holdings (ETFs). Amounts split equally
+    across the {len(rec["picks"])} picks from whatever's above your cash reserve target.
+  </p>
+  <p style="font-size:12px;color:#9a6700;">
+    Binance has no API for marking favorites &mdash; favorite these manually in the app: {favorite_list}
+  </p>
+</div>
+"""
+
+
 def send_report_email(subject, text_body, html_body):
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
@@ -323,6 +452,16 @@ def main():
     rows, total_value = compute_rows(holdings, prices, watchlist_targets)
     text_body = render_text(rows, total_value)
     html_body = render_html(rows, total_value)
+
+    try:
+        rec = compute_recommendations(get_stablecoin_balance())
+        text_body += render_recommendations_text(rec)
+        html_body += render_recommendations_html(rec)
+    except Exception as e:
+        print(f"Note: couldn't build this week's candidate recommendations: {e}", file=sys.stderr)
+        text_body += f"\n\n(Couldn't pull this week's halal candidates: {e})"
+        html_body += f'<p style="color:#9a6700;">(Couldn\'t pull this week\'s halal candidates: {escape(str(e))})</p>'
+
     send_report_email("Weekly portfolio review", text_body, html_body)
 
 
