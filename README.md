@@ -1,15 +1,17 @@
 # Halal Portfolio Weekly Review
 
-A read-only weekly email about your Binance stocks/ETF holdings: a Sharia
-compliance re-check, concentration warnings, additional ethics screening, and
-a shortlist of Sharia-compliant candidate stocks & ETFs for new money.
-**It never places an order** — see
-[weekly_portfolio_review.py](weekly_portfolio_review.py).
+This is a small helper that checks your Binance stock/ETF portfolio once a
+week and emails you a report. It looks at three things: whether your
+holdings are still Sharia-compliant, whether you're too concentrated in any
+one stock, and whether anything you own trips a couple of extra ethics
+checks. It also suggests a few new Sharia-compliant stocks and ETFs you could
+add. **It only reads your account and sends an email — it never buys or
+sells anything for you.**
 
-**This is not financial advice.** It automates mechanical rules (a Musaffa
-screener filter you chose, a cash-reserve target, and additional exclusion
-lists) — it doesn't exercise investment judgment on your behalf, and the
-candidate lists it surfaces are not a recommendation to buy.
+**This is not financial advice.** It just applies a fixed, mechanical set of
+rules every week (a screener filter you picked, a cash target, some
+exclusion lists) — it isn't making judgment calls, and the stocks/ETFs it
+suggests aren't a recommendation to actually buy them.
 
 ## What's here
 
