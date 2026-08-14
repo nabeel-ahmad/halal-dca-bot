@@ -16,12 +16,16 @@ Binance equity holdings:
      is exactly the case you'd want a human to look at.
 
   2. Mechanical concentration numbers: weight of each position, and a
-     flag if any position exceeds CONCENTRATION_WARN_PCT of the portfolio,
-     plus deviation from the target weights in halal_universe.csv if that
-     ticker is in your watchlist. This reports numbers against your own
-     stated targets — it does not recommend what to buy or sell.
+     flag if any position exceeds CONCENTRATION_WARN_PCT of the portfolio.
+     This reports numbers, not what to buy or sell.
 
-SECURITY: never hardcode credentials. Same env vars as halal_dca_bot.py.
+  3. Candidate stocks/ETFs matching a Musaffa screener filter you specified
+     (Sharia-compliant, rating A/A+, analyst Buy/Strong Buy), excluding
+     anything on the BDS priority-boycott list or a major US DoD prime
+     contractor, with a mechanical $ split of idle cash above your reserve
+     target.
+
+SECURITY: never hardcode credentials. Env vars pulled from binance_equity.py.
 """
 
 import os
@@ -36,21 +40,22 @@ from html import escape, unescape
 
 import requests
 
-from halal_dca_bot import (
+from binance_equity import (
     BINANCE_API_KEY,
     EMAIL_TO,
     SMTP_HOST,
     SMTP_PASSWORD,
     SMTP_PORT,
     SMTP_USER,
-    UNIVERSE_FILE,
     _binance_signed_request,
     get_account_holdings,
     get_current_prices,
-    load_watchlist,
     send_email_message,
 )
-from musaffa_recommendations import get_etf_candidates, get_stock_candidates
+from ethics_screens import BDS_TARGETS, DOD_CONTRACTORS, check_ethics_flags
+from musaffa_recommendations import enrich_with_halal_grade, get_etf_candidates, get_stock_candidates
+
+EXCLUDED_TICKERS = frozenset(BDS_TARGETS) | frozenset(DOD_CONTRACTORS)
 
 CONCENTRATION_WARN_PCT = Decimal(os.environ.get("CONCENTRATION_WARN_PCT", "30"))
 CASH_RESERVE_TARGET_USD = Decimal(os.environ.get("CASH_RESERVE_TARGET_USD", "500"))
@@ -137,8 +142,8 @@ MANUAL_LINKS = (
 )
 
 
-def compute_rows(holdings, prices, watchlist_targets):
-    """One pass over holdings: compliance check + weight/target-deviation, in a
+def compute_rows(holdings, prices):
+    """One pass over holdings: compliance check + weight/concentration, in a
     single structured form both the text and HTML renderers read from."""
     total_value = sum(qty * prices[t] for t, qty in holdings.items())
     rows = []
@@ -146,8 +151,6 @@ def compute_rows(holdings, prices, watchlist_targets):
         overall, sources = check_compliance(ticker)
         value = qty * prices[ticker]
         pct = (value / total_value * 100).quantize(Decimal("0.1"), rounding=ROUND_HALF_UP) if total_value else Decimal("0")
-        target = watchlist_targets.get(ticker)
-        target_pct = (target * 100).quantize(Decimal("0.1")) if target is not None else None
         over_concentrated = pct > CONCENTRATION_WARN_PCT or len(holdings) == 1
         rows.append({
             "ticker": ticker,
@@ -155,9 +158,8 @@ def compute_rows(holdings, prices, watchlist_targets):
             "sources": sources,
             "value": value,
             "pct": pct if len(holdings) > 1 else Decimal("100"),
-            "target_pct": target_pct,
-            "deviation": (pct - target_pct) if target_pct is not None else None,
             "over_concentrated": over_concentrated,
+            "ethics_flags": check_ethics_flags(ticker),
         })
         time.sleep(1)  # be polite — one fetch per ticker per week per source
     return rows, total_value
@@ -167,6 +169,7 @@ def render_text(rows, total_value):
     lines = []
     flagged_compliance = [r for r in rows if r["compliance"] != COMPLIANT]
     flagged_concentration = [r for r in rows if r["over_concentrated"]]
+    flagged_ethics = [r for r in rows if r["ethics_flags"]]
 
     summary = []
     if flagged_compliance:
@@ -175,6 +178,12 @@ def render_text(rows, total_value):
         summary.append(
             f"CONCENTRATION (>{CONCENTRATION_WARN_PCT}% or single-holding): "
             + ", ".join(f"{r['ticker']} at {r['pct']}%" for r in flagged_concentration)
+        )
+    if flagged_ethics:
+        summary.append(
+            "ETHICS: " + ", ".join(
+                f"{r['ticker']} ({'/'.join(f['type'] for f in r['ethics_flags'])})" for r in flagged_ethics
+            )
         )
     if not summary:
         summary.append("Nothing flagged this week.")
@@ -186,13 +195,12 @@ def render_text(rows, total_value):
         for name, (status, url, detail) in r["sources"].items():
             lines.append(f"    {name}: {status} ({detail}) — {url}")
         lines.append("    manual cross-check: " + " | ".join(MANUAL_LINKS))
+        for f in r["ethics_flags"]:
+            lines.append(f"    ⚠ {f['type']}: {f['detail']} — {f['source']}")
 
     lines.append("\n=== Position weights & concentration ===\n")
     for r in rows:
-        line = f"{r['ticker']}: ${r['value']:.2f} ({r['pct']}% of portfolio)"
-        if r["target_pct"] is not None:
-            line += f" — target {r['target_pct']}%, deviation {r['deviation']:+.1f}pp"
-        lines.append(line)
+        lines.append(f"{r['ticker']}: ${r['value']:.2f} ({r['pct']}% of portfolio)")
     lines.append(f"\nTotal portfolio value: ${total_value:.2f}")
 
     return "\n".join(lines)
@@ -201,12 +209,19 @@ def render_text(rows, total_value):
 def render_html(rows, total_value):
     flagged_compliance = [r for r in rows if r["compliance"] != COMPLIANT]
     flagged_concentration = [r for r in rows if r["over_concentrated"]]
+    flagged_ethics = [r for r in rows if r["ethics_flags"]]
 
     def badge(status):
         return (
             f'<span style="background:{BADGE_BG[status]};color:{COLOR[status]};'
             f'border-radius:4px;padding:2px 8px;font-weight:600;white-space:nowrap;">'
             f'{SYMBOL[status]} {escape(status.replace("_", " "))}</span>'
+        )
+
+    def ethics_badge(flag_type):
+        return (
+            f'<span style="background:#ffebe9;color:#cf222e;border-radius:4px;padding:2px 8px;'
+            f'font-weight:600;white-space:nowrap;">🚫 {escape(flag_type)}</span>'
         )
 
     summary_parts = []
@@ -219,6 +234,13 @@ def render_html(rows, total_value):
             f"<b>Concentration</b> (&gt;{CONCENTRATION_WARN_PCT}% or single-holding): "
             + ", ".join(f"\U0001f534 {escape(r['ticker'])} at {r['pct']}%" for r in flagged_concentration)
         )
+    if flagged_ethics:
+        summary_parts.append(
+            "<b>Ethics:</b> " + ", ".join(
+                f"{escape(r['ticker'])} " + " ".join(ethics_badge(f["type"]) for f in r["ethics_flags"])
+                for r in flagged_ethics
+            )
+        )
     summary_html = "<br>".join(summary_parts) if summary_parts else "✅ Nothing flagged this week."
 
     def compliance_row(r):
@@ -226,26 +248,26 @@ def render_html(rows, total_value):
             f'<a href="{url}" style="color:#57606a;text-decoration:none;">{escape(name)}: {SYMBOL[status]} {escape(detail)}</a>'
             for name, (status, url, detail) in r["sources"].items()
         )
+        ethics_html = ""
+        if r["ethics_flags"]:
+            ethics_html = "<br>" + "<br>".join(
+                f'<span style="color:#cf222e;">🚫 {escape(f["type"])}: {escape(f["detail"])}</span>' for f in r["ethics_flags"]
+            )
         return (
             "<tr>"
             f'<td style="padding:8px;border-bottom:1px solid #d0d7de;font-weight:600;">{escape(r["ticker"])}</td>'
             f'<td style="padding:8px;border-bottom:1px solid #d0d7de;">{badge(r["compliance"])}</td>'
-            f'<td style="padding:8px;border-bottom:1px solid #d0d7de;font-size:12px;">{sources_html}</td>'
+            f'<td style="padding:8px;border-bottom:1px solid #d0d7de;font-size:12px;">{sources_html}{ethics_html}</td>'
             "</tr>"
         )
 
     def weight_row(r):
-        dev_cell = ""
-        if r["target_pct"] is not None:
-            dev_color = "#cf222e" if abs(r["deviation"]) >= 5 else "#57606a"
-            dev_cell = f'<span style="color:{dev_color};">{r["deviation"]:+.1f}pp</span> (target {r["target_pct"]}%)'
         conc_symbol = "\U0001f534" if r["over_concentrated"] else "\U0001f7e2"
         return (
             "<tr>"
             f'<td style="padding:8px;border-bottom:1px solid #d0d7de;font-weight:600;">{escape(r["ticker"])}</td>'
             f'<td style="padding:8px;border-bottom:1px solid #d0d7de;">${r["value"]:.2f}</td>'
             f'<td style="padding:8px;border-bottom:1px solid #d0d7de;">{conc_symbol} {r["pct"]}%</td>'
-            f'<td style="padding:8px;border-bottom:1px solid #d0d7de;">{dev_cell}</td>'
             "</tr>"
         )
 
@@ -277,7 +299,6 @@ def render_html(rows, total_value):
         <th style="padding:8px;border-bottom:2px solid #d0d7de;">Ticker</th>
         <th style="padding:8px;border-bottom:2px solid #d0d7de;">Value</th>
         <th style="padding:8px;border-bottom:2px solid #d0d7de;">% of portfolio</th>
-        <th style="padding:8px;border-bottom:2px solid #d0d7de;">vs. target</th>
       </tr>
     </thead>
     <tbody>
@@ -307,9 +328,13 @@ def compute_recommendations(stablecoin_balance):
     cash sits above CASH_RESERVE_TARGET_USD equally across the picks. This
     doesn't pick stocks by growth judgment — it reports what your own filter
     returns and does the arithmetic to keep cash under your target."""
-    stocks = get_stock_candidates(NUM_STOCK_PICKS)
-    etfs = get_etf_candidates(NUM_ETF_PICKS)
+    stocks = get_stock_candidates(NUM_STOCK_PICKS, exclude_tickers=EXCLUDED_TICKERS)
+    etfs = get_etf_candidates(NUM_ETF_PICKS, exclude_tickers=EXCLUDED_TICKERS)
     picks = [dict(p, asset_type="stock") for p in stocks] + [dict(p, asset_type="etf") for p in etfs]
+    enrich_with_halal_grade(picks)
+    for p in picks:
+        path = "etf" if p["asset_type"] == "etf" else "stock"
+        p["musaffa_url"] = f"https://musaffa.com/{path}/{p['ticker']}"
 
     investable = max(Decimal("0"), stablecoin_balance - CASH_RESERVE_TARGET_USD)
     per_asset = (investable / len(picks)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP) if picks else Decimal("0")
@@ -335,19 +360,24 @@ def render_recommendations_text(rec):
         lines.append("Nothing above the cash reserve target to deploy this week — candidates listed for reference only.")
     lines.append("")
     for p in rec["picks"]:
+        grade_note = p["halal_grade"] if p["halal_grade"] != "UNKNOWN" else f"UNKNOWN (verify: {p['musaffa_url']})"
         if p["asset_type"] == "stock":
             lines.append(
-                f"[STOCK] {p['ticker']} — {p['name']} | analyst rating: {p['analyst_rating']} | "
+                f"[STOCK] {p['ticker']} — {p['name']} | halal rating: {grade_note} | "
+                f"analyst rating: {p['analyst_rating']} | "
                 f"sector: {p['sector']} | mkt cap: {p['market_cap']} | suggested: ${p['suggested_usd']:.2f}"
             )
         else:
             lines.append(
-                f"[ETF]   {p['ticker']} — {p['name']} | holdings: {p['num_holdings']} | "
+                f"[ETF]   {p['ticker']} — {p['name']} | halal rating: {grade_note} | "
+                f"holdings: {p['num_holdings']} | "
                 f"segment: {p['segment']} | suggested: ${p['suggested_usd']:.2f}"
             )
     lines.append(
         "\nFilter applied (Musaffa screener): Sharia-compliant, Musaffa rating A/A+, "
-        "analyst consensus Buy/Strong Buy (stocks) — sorted by number of holdings (ETFs)."
+        "analyst consensus Buy/Strong Buy (stocks) — sorted by number of holdings (ETFs). "
+        "Also excludes anything on the BDS priority-boycott list or a major US DoD prime "
+        "contractor (see ethics_screens.py)."
     )
     lines.append(
         "Binance has no API for marking favorites — favorite these manually in the app: "
@@ -357,6 +387,15 @@ def render_recommendations_text(rec):
 
 
 def render_recommendations_html(rec):
+    def grade_badge(p):
+        grade = p["halal_grade"]
+        color = "#9a6700" if grade == "UNKNOWN" else "#1a7f37"
+        bg = "#fff8c5" if grade == "UNKNOWN" else "#dafbe1"
+        badge = f'<span style="background:{bg};color:{color};border-radius:4px;padding:2px 6px;font-weight:600;white-space:nowrap;">{escape(grade)}</span>'
+        if grade == "UNKNOWN":
+            badge += f'<br><a href="{p["musaffa_url"]}" style="font-size:11px;color:#57606a;">verify</a>'
+        return badge
+
     def pick_row(p):
         if p["asset_type"] == "stock":
             detail = f"{escape(p['sector'])} · {escape(p['market_cap'])} · analyst: <b>{escape(p['analyst_rating'])}</b>"
@@ -368,6 +407,7 @@ def render_recommendations_html(rec):
             "<tr>"
             f'<td style="padding:8px;border-bottom:1px solid #d0d7de;font-weight:600;">{escape(p["ticker"])}</td>'
             f'<td style="padding:8px;border-bottom:1px solid #d0d7de;">{type_badge}</td>'
+            f'<td style="padding:8px;border-bottom:1px solid #d0d7de;">{grade_badge(p)}</td>'
             f'<td style="padding:8px;border-bottom:1px solid #d0d7de;font-size:12px;">{escape(p["name"])}<br>{detail}</td>'
             f'<td style="padding:8px;border-bottom:1px solid #d0d7de;text-align:right;">${p["suggested_usd"]:.2f}</td>'
             "</tr>"
@@ -403,7 +443,8 @@ def render_recommendations_html(rec):
   </table>
   <p style="font-size:12px;color:#57606a;">
     Filter applied (Musaffa screener): Sharia-compliant, Musaffa rating A/A+, analyst consensus
-    Buy/Strong Buy (stocks) &mdash; sorted by number of holdings (ETFs). Amounts split equally
+    Buy/Strong Buy (stocks) &mdash; sorted by number of holdings (ETFs). Also excludes anything
+    on the BDS priority-boycott list or a major US DoD prime contractor. Amounts split equally
     across the {len(rec["picks"])} picks from whatever's above your cash reserve target.
   </p>
   <p style="font-size:12px;color:#9a6700;">
@@ -442,14 +483,7 @@ def main():
 
     prices = get_current_prices(list(holdings))
 
-    watchlist_targets = {}
-    try:
-        for w in load_watchlist(UNIVERSE_FILE):
-            watchlist_targets[w["ticker"]] = w["target_weight"]
-    except (FileNotFoundError, ValueError) as e:
-        print(f"Note: couldn't load {UNIVERSE_FILE} for target-weight comparison: {e}", file=sys.stderr)
-
-    rows, total_value = compute_rows(holdings, prices, watchlist_targets)
+    rows, total_value = compute_rows(holdings, prices)
     text_body = render_text(rows, total_value)
     html_body = render_html(rows, total_value)
 

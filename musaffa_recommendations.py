@@ -43,6 +43,13 @@ TICKER_TOKEN_RE = re.compile(r"^[A-Z0-9.]{1,6}$")
 
 ANALYST_RANK = {"strong buy": 0, "buy": 1, "hold": 2, "sell": 3, "strong sell": 4}
 
+# The screener table's Halal Rating *column* shows "Unlock" for anonymous
+# sessions, but each ticker's own detail page renders the real letter grade
+# for free (confirmed via headless browser — it's JS-rendered, not in the
+# raw HTML either, so a plain HTTP GET won't see it). Pattern seen there:
+# "Current Shariah Compliance ... Screening Methodology: AAOIFI\n\nHALAL\nA+".
+GRADE_RE = re.compile(r"Screening Methodology:\s*AAOIFI\s*\n+\s*(?:HALAL|NOT HALAL)\s*\n+\s*([A-D][+-]?|-)", re.I)
+
 
 def _scrape_rows(url, timeout_ms=20000):
     with sync_playwright() as p:
@@ -59,6 +66,38 @@ def _scrape_rows(url, timeout_ms=20000):
         finally:
             browser.close()
     return [r for r in rows if r and r[0:1] != ["No Data"] and len(r) > 1]
+
+
+def enrich_with_halal_grade(picks, timeout_ms=20000):
+    """Adds a 'halal_grade' field (e.g. "A+") to each pick by loading its own
+    detail page. One browser, one page per ticker — fine for the ~10 picks
+    this runs against, not meant for scanning the whole screener."""
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        try:
+            page = browser.new_page()
+            for pick in picks:
+                path = "etf" if pick["asset_type"] == "etf" else "stock"
+                url = f"https://musaffa.com/{path}/{pick['ticker']}"
+                try:
+                    page.goto(url, wait_until="networkidle", timeout=timeout_ms)
+                    # The "Screening Methodology" label renders before the grade
+                    # itself, which arrives via a separate async call — poll
+                    # instead of waiting on a fixed delay or on the label alone.
+                    grade = None
+                    for _ in range(20):
+                        text = page.inner_text("body")
+                        m = GRADE_RE.search(text)
+                        if m:
+                            grade = m.group(1).upper()
+                            break
+                        page.wait_for_timeout(1000)
+                    pick["halal_grade"] = grade or "UNKNOWN"
+                except Exception:
+                    pick["halal_grade"] = "UNKNOWN"
+        finally:
+            browser.close()
+    return picks
 
 
 def _parse_name_cell(cell):
@@ -80,15 +119,16 @@ def _parse_name_cell(cell):
     return None, cell
 
 
-def get_stock_candidates(limit=7):
+def get_stock_candidates(limit=7, exclude_tickers=frozenset()):
     """Sharia-compliant, Musaffa rating A/A+, analyst Buy/Strong Buy — sorted
     by analyst rating (Strong Buy first), tie-broken by the screener's own
-    order (its rating-desc sort)."""
+    order (its rating-desc sort). exclude_tickers is filtered out before
+    truncating to limit, so excluded picks don't shrink the result count."""
     rows = _scrape_rows(STOCK_SCREENER_URL)
     candidates = []
     for row in rows:
         ticker, name = _parse_name_cell(row[1])
-        if not ticker:
+        if not ticker or ticker in exclude_tickers:
             continue
         analyst_rating = row[4]
         candidates.append({
@@ -103,14 +143,14 @@ def get_stock_candidates(limit=7):
     return candidates[:limit]
 
 
-def get_etf_candidates(limit=3):
+def get_etf_candidates(limit=3, exclude_tickers=frozenset()):
     """Sharia-compliant, Musaffa rating A/A+ — already sorted by number of
     holdings (a diversification proxy) via the URL's sortBy param."""
     rows = _scrape_rows(ETF_SCREENER_URL)
     candidates = []
     for row in rows:
         ticker, name = _parse_name_cell(row[1])
-        if not ticker:
+        if not ticker or ticker in exclude_tickers:
             continue
         candidates.append({
             "ticker": ticker,

@@ -4,15 +4,14 @@
 # Sunday 10:00 in Pakistan Standard Time (UTC+5, no DST) — this machine's
 # local timezone. Adjust the cron line if that's ever wrong.
 #
-# Self-hosted runner, same reasons as halal-dca-bot.yml: Binance blocks
-# GitHub-hosted-runner IPs with HTTP 451. The runner must be online (Mac
-# powered on, runner service running) at trigger time — a missed weekly
-# window is more likely than a missed monthly one, so keep the Mac awake
-# Sunday mornings if this starts silently skipping.
+# Self-hosted runner: Binance blocks GitHub-hosted-runner IPs with HTTP 451.
+# The runner must be online (Mac powered on, runner service running) at
+# trigger time — keep the Mac awake Sunday mornings if this starts silently
+# skipping.
 #
-# Read-only — never places orders. Needs these repo secrets (same ones
-# used by halal-dca-bot.yml): BINANCE_API_KEY, BINANCE_API_SECRET,
-# SMTP_HOST, SMTP_USER, SMTP_PASSWORD, EMAIL_TO.
+# Read-only — never places orders. Needs these repo secrets:
+# BINANCE_API_KEY, BINANCE_API_SECRET, SMTP_HOST, SMTP_USER, SMTP_PASSWORD,
+# EMAIL_TO.
 
 name: Weekly Portfolio Review
 
