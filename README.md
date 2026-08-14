@@ -1,13 +1,13 @@
 # Halal Portfolio Weekly Review
 
 A read-only weekly email about your Binance stocks/ETF holdings: a Sharia
-compliance re-check, concentration warnings, BDS-boycott/Pentagon-contractor
-flags, and a shortlist of Sharia-compliant candidate stocks & ETFs for new
-money. **It never places an order** — see
+compliance re-check, concentration warnings, additional ethics screening, and
+a shortlist of Sharia-compliant candidate stocks & ETFs for new money.
+**It never places an order** — see
 [weekly_portfolio_review.py](weekly_portfolio_review.py).
 
 **This is not financial advice.** It automates mechanical rules (a Musaffa
-screener filter you chose, a cash-reserve target, BDS/DoD-contractor exclusion
+screener filter you chose, a cash-reserve target, and additional exclusion
 lists) — it doesn't exercise investment judgment on your behalf, and the
 candidate lists it surfaces are not a recommendation to buy.
 
@@ -15,10 +15,10 @@ candidate lists it surfaces are not a recommendation to buy.
 
 | File | Purpose |
 |---|---|
-| `weekly_portfolio_review.py` | Entry point. Re-checks current holdings' Sharia compliance (Musaffa + Zoya), flags concentration risk and BDS/Pentagon-contractor exposure, and emails a shortlist of A/A+-rated candidate stocks & ETFs matching a Musaffa screener filter, with a mechanical $ split of idle cash. |
+| `weekly_portfolio_review.py` | Entry point. Re-checks current holdings' Sharia compliance (Musaffa + Zoya), flags concentration risk and additional ethics screens, and emails a shortlist of A/A+-rated candidate stocks & ETFs matching a Musaffa screener filter, with a mechanical $ split of idle cash. |
 | `binance_equity.py` | Binance Stocks Trading API client (signed requests, holdings, prices) + SMTP sender, shared by the review script. |
 | `musaffa_recommendations.py` | Headless-browser (Playwright) scraper for the Musaffa screener and per-ticker Halal Rating grade — the screener table is JS-rendered, so a plain HTTP request won't see it. |
-| `ethics_screens.py` | Small, manually-curated reference lists: BDS priority-boycott targets (sourced from bdsmovement.net) and major US DoD prime contractors (sourced from public federal contract data). Used to warn on existing holdings and exclude from new candidates. |
+| `ethics_screens.py` | Small, manually-curated reference lists used to warn on existing holdings and exclude from new candidates — see inline comments in the file for sourcing. |
 | `.env.example` | Template for local env vars — copy to `.env` for local testing only, never commit a real one. |
 | `.github/workflows/weekly-portfolio-review.yml` | Weekly schedule (Sunday 05:00 UTC / 10:00 PKT) + manual trigger. |
 
@@ -52,21 +52,11 @@ instead. That means:
 
 ## Ethics screens
 
-`ethics_screens.py` holds two short, manually-curated lists — not large
-structured databases, since neither BDS nor a DoD-contractor registry
-publishes one as a clean API. Re-verify against the source pages
-periodically; a stale list under- or over-flags silently otherwise.
-
-- **BDS**: named priority-boycott targets from
-  https://bdsmovement.net/get-involved/what-to-boycott — reported as "this
-  named source lists this company," not as Claude's own judgment.
-- **Pentagon**: major US DoD prime contractors by contract value, from
-  public USAspending.gov federal award data.
-
-An AIPAC-affiliation screen was explicitly **not** built — there's no
-reliable public database mapping companies to political-lobby affiliation,
-and inferring one would mean making subjective, contestable claims about
-specific real companies.
+`ethics_screens.py` holds short, manually-curated reference lists — not large
+structured databases, since no clean API publishes this data. Sourcing and
+scope notes live as inline comments in that file rather than here. Re-verify
+against the source pages periodically; a stale list under- or over-flags
+silently otherwise.
 
 ## Safety
 

@@ -1,13 +1,14 @@
 ---
 name: halal-portfolio-review
-description: Run, debug, or extend the weekly halal portfolio review (weekly_portfolio_review.py) — Sharia compliance re-check, concentration warnings, BDS/Pentagon ethics flags, Musaffa candidate recommendations. Use when asked to run the weekly review, diagnose a failed or flaky run, add/update the BDS or DoD-contractor screen, or explain why a ticker was flagged or excluded from recommendations.
+description: Run, debug, or extend the weekly halal portfolio review (weekly_portfolio_review.py) — Sharia compliance re-check, concentration warnings, ethics screens, Musaffa candidate recommendations. Use when asked to run the weekly review, diagnose a failed or flaky run, add/update an ethics screen list, or explain why a ticker was flagged or excluded from recommendations.
 ---
 
 # Halal portfolio review
 
 Read-only pipeline: re-checks current Binance equity holdings for Sharia
-compliance, flags concentration and BDS/Pentagon exposure, and emails a
-shortlist of A/A+-rated candidate stocks & ETFs. It never places an order.
+compliance, flags concentration risk and other ethics-screen exposure, and
+emails a shortlist of A/A+-rated candidate stocks & ETFs. It never places an
+order.
 Full architecture is in [README.md](../../../README.md) — read that first for
 file layout and the self-hosted-runner requirement; this skill covers the
 parts that aren't already legible from the code.
@@ -58,18 +59,18 @@ paths still print a note and continue.
   between the two surfaces as `UNKNOWN` by design (fail toward "check this
   yourself," never toward a false-positive "compliant").
 
-## Updating the BDS / Pentagon-contractor screens
+## Updating the ethics-screen lists
 
-`ethics_screens.py` holds two short, hand-curated lists (`BDS_TARGETS`,
-`DOD_CONTRACTORS`) — not a scraped or API-backed feed, since neither source
-publishes one. To add or correct an entry: verify the company and its ticker
-independently before adding — a wrong ticker either clears a real boycott
-target or falsely flags an unrelated one, and both are worse than leaving a
-ticker unlisted. Re-check `BDS_TARGETS` against
-https://bdsmovement.net/get-involved/what-to-boycott periodically; it's prose
-on a webpage, not a table, so this is a manual read, not a scrape.
+`ethics_screens.py` holds short, hand-curated reference lists — not a scraped
+or API-backed feed, since no clean source publishes one. Sourcing and scope
+notes for each list live as inline comments in that file. To add or correct
+an entry: verify the company and its ticker independently before adding — a
+wrong ticker either clears a real flagged target or falsely flags an
+unrelated one, and both are worse than leaving a ticker unlisted. Re-check
+each list against its cited source periodically, since the sources are prose
+pages, not scrapable tables.
 
-Do not build an AIPAC-affiliation screen the same way — there's no reliable
-public database mapping companies to political-lobby affiliation, and a
-hand-curated guess here would be an unsupported claim about a real company,
-not a sourced fact like the two lists above.
+Do not build a screen based on inferred political-lobby affiliation — there's
+no reliable public database for that, and a hand-curated guess would be an
+unsupported claim about a real company, not a sourced fact like the lists
+above.
