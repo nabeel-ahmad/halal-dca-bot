@@ -4,10 +4,13 @@ Weekly Portfolio Review — READ-ONLY, no orders ever placed.
 Runs every Sunday and emails you two things about your actual current
 Binance equity holdings:
 
-  1. Sharia compliance re-check, against your two trusted sources that
-     publish a free, machine-readable compliance page per ticker:
-       - Musaffa (musaffa.com/stock/<TICKER>)
-       - Zoya (zoya.finance/stocks/<ticker>)
+  1. Sharia compliance re-check, against your trusted sources, all queried
+     in parallel:
+       - Musaffa (musaffa.com/stock/<TICKER>) — scraped
+       - Zoya (zoya.finance/stocks/<ticker>) — scraped
+       - Halal Terminal (api.halalterminal.com) — real API, only checked if
+         HALAL_TERMINAL_API_KEY is set (sign up yourself for a key; this
+         project never creates accounts or handles credentials for you)
      Hyssa blocks non-browser requests (403) and Islamic Finance Guru
      charges per-ticker screening, so both are only linked for manual
      cross-check, not scraped.
@@ -41,6 +44,7 @@ import re
 import smtplib
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal, ROUND_HALF_UP
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -75,6 +79,7 @@ CONCENTRATION_WARN_PCT = Decimal(os.environ.get("CONCENTRATION_WARN_PCT", "30"))
 CASH_RESERVE_TARGET_USD = Decimal(os.environ.get("CASH_RESERVE_TARGET_USD", "500"))
 NUM_STOCK_PICKS = int(os.environ.get("NUM_STOCK_PICKS", "7"))
 NUM_ETF_PICKS = int(os.environ.get("NUM_ETF_PICKS", "3"))
+HALAL_TERMINAL_API_KEY = os.environ.get("HALAL_TERMINAL_API_KEY", "")
 HTTP_TIMEOUT = 15
 USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -134,8 +139,46 @@ def check_zoya(ticker):
     return (NON_COMPLIANT if m.group(1) else COMPLIANT), url, ("not Shariah-compliant" if m.group(1) else "Shariah-compliant")
 
 
+def check_halal_terminal(ticker):
+    """api.halalterminal.com/api/screen/<TICKER> — real JSON API (not a
+    scrape), screening against AAOIFI/DJIM/FTSE/MSCI/S&P simultaneously.
+    Only called when HALAL_TERMINAL_API_KEY is set — sign up yourself at
+    halalterminal.com for a free-tier key; this project never creates
+    accounts or holds credentials on your behalf."""
+    url = f"https://api.halalterminal.com/api/screen/{ticker}"
+    if not HALAL_TERMINAL_API_KEY:
+        return UNKNOWN, url, "HALAL_TERMINAL_API_KEY not set — skipped"
+    try:
+        resp = requests.post(url, headers={"X-API-Key": HALAL_TERMINAL_API_KEY}, timeout=HTTP_TIMEOUT)
+    except requests.RequestException as e:
+        return UNKNOWN, url, f"fetch failed: {e}"
+
+    if resp.status_code == 401:
+        return UNKNOWN, url, "API key missing or invalid"
+    if resp.status_code == 429:
+        return UNKNOWN, url, "quota exceeded"
+    try:
+        resp.raise_for_status()
+        data = resp.json()
+    except (requests.RequestException, ValueError) as e:
+        return UNKNOWN, url, f"fetch failed: {e}"
+
+    status = data.get("shariah_compliance_status")
+    if status == "compliant":
+        return COMPLIANT, url, status
+    if status == "non_compliant":
+        return NON_COMPLIANT, url, status
+    return UNKNOWN, url, data.get("error_message") or status or "insufficient data"
+
+
 def check_compliance(ticker):
-    results = {"musaffa": check_musaffa(ticker), "zoya": check_zoya(ticker)}
+    checks = {"musaffa": check_musaffa, "zoya": check_zoya}
+    if HALAL_TERMINAL_API_KEY:
+        checks["halal_terminal"] = check_halal_terminal
+    with ThreadPoolExecutor(max_workers=len(checks)) as pool:
+        futures = {name: pool.submit(fn, ticker) for name, fn in checks.items()}
+        results = {name: future.result() for name, future in futures.items()}
+
     statuses = {v[0] for v in results.values()}
     if NON_COMPLIANT in statuses:
         overall = NON_COMPLIANT

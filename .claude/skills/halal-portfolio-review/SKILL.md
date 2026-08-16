@@ -23,6 +23,8 @@ parts that aren't already legible from the code.
 2. Confirm required env vars are set (`BINANCE_API_KEY`, `BINANCE_API_SECRET`,
    `SMTP_HOST`, `SMTP_USER`, `SMTP_PASSWORD`, `EMAIL_TO` — see
    `.env.example`). Locally, source a `.env`; in CI these are repo secrets.
+   `HALAL_TERMINAL_API_KEY` is optional — its check is skipped, not
+   `UNKNOWN`-flagged, when unset.
 3. Run `python weekly_portfolio_review.py` directly for a full live run
    (sends a real email), or import individual functions in a REPL to test
    one piece — `compute_recommendations`, `check_compliance`,
@@ -55,10 +57,19 @@ paths still print a note and continue.
   by opening the screener in a browser, applying the filters through the UI,
   and copying the resulting address bar URL.
 - **A holding's compliance shows `UNKNOWN`**: `check_compliance` in
-  `weekly_portfolio_review.py` requires both Musaffa and Zoya to agree on
+  `weekly_portfolio_review.py` requires every configured source to agree on
   `COMPLIANT` — any fetch failure, page-structure mismatch, or disagreement
-  between the two surfaces as `UNKNOWN` by design (fail toward "check this
-  yourself," never toward a false-positive "compliant").
+  between sources surfaces as `UNKNOWN` by design (fail toward "check this
+  yourself," never toward a false-positive "compliant"). Sources run in
+  parallel via a `ThreadPoolExecutor`, so one slow source doesn't add to the
+  others' latency.
+- **Halal Terminal always shows `UNKNOWN` / "not set — skipped"**:
+  `HALAL_TERMINAL_API_KEY` isn't set in this environment, so
+  `check_compliance` doesn't include it at all (see `if
+  HALAL_TERMINAL_API_KEY:` in `check_compliance`) — the row you see is
+  `check_halal_terminal`'s own early return, not a real API failure. A 401
+  means the key itself is wrong; 429 means the free-tier quota (token-based,
+  5 tokens per screen) ran out for the period.
 - **A holding is missing from "Consider selling" despite a bad grade, or
   vice versa**: `grade_below_a` in `musaffa_recommendations.py` treats
   `UNKNOWN` as not-a-downgrade on purpose — a scrape timeout isn't a real
