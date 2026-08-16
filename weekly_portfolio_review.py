@@ -19,7 +19,15 @@ Binance equity holdings:
      flag if any position exceeds CONCENTRATION_WARN_PCT of the portfolio.
      This reports numbers, not what to buy or sell.
 
-  3. Candidate stocks/ETFs matching a Musaffa screener filter you specified
+  3. A "Consider selling" list: any held ticker that's gone NON_COMPLIANT,
+     picked up an ethics flag, or had its Musaffa halal letter grade drop
+     below A (A- or lower) since it was bought. This is informational only
+     — no order is ever placed — and is not based on analyst rating, since
+     Musaffa doesn't expose a per-ticker analyst-consensus rating outside
+     its screener (only for the small set of tickers the screener itself
+     returns, not arbitrary held tickers).
+
+  4. Candidate stocks/ETFs matching a Musaffa screener filter you specified
      (Sharia-compliant, rating A/A+, analyst Buy/Strong Buy), excluding
      anything on the BDS priority-boycott list or a major US DoD prime
      contractor, with a mechanical $ split of idle cash above your reserve
@@ -53,7 +61,13 @@ from binance_equity import (
     send_email_message,
 )
 from ethics_screens import BDS_TARGETS, DOD_CONTRACTORS, check_ethics_flags
-from musaffa_recommendations import enrich_with_halal_grade, get_etf_candidates, get_stock_candidates
+from musaffa_recommendations import (
+    enrich_with_halal_grade,
+    get_etf_candidates,
+    get_halal_grades,
+    get_stock_candidates,
+    grade_below_a,
+)
 
 EXCLUDED_TICKERS = frozenset(BDS_TARGETS) | frozenset(DOD_CONTRACTORS)
 
@@ -146,12 +160,27 @@ def compute_rows(holdings, prices):
     """One pass over holdings: compliance check + weight/concentration, in a
     single structured form both the text and HTML renderers read from."""
     total_value = sum(qty * prices[t] for t, qty in holdings.items())
+    try:
+        halal_grades = get_halal_grades(holdings)
+    except Exception as e:
+        print(f"Note: couldn't pull halal grades for holdings: {e}", file=sys.stderr)
+        halal_grades = {}
+
     rows = []
     for ticker, qty in sorted(holdings.items(), key=lambda kv: -(kv[1] * prices[kv[0]])):
         overall, sources = check_compliance(ticker)
         value = qty * prices[ticker]
         pct = (value / total_value * 100).quantize(Decimal("0.1"), rounding=ROUND_HALF_UP) if total_value else Decimal("0")
         over_concentrated = pct > CONCENTRATION_WARN_PCT or len(holdings) == 1
+        halal_grade = halal_grades.get(ticker, "UNKNOWN")
+        sell_reasons = []
+        if overall == NON_COMPLIANT:
+            sell_reasons.append("no longer Sharia-compliant")
+        ethics_flags = check_ethics_flags(ticker)
+        if ethics_flags:
+            sell_reasons.append("/".join(f["type"] for f in ethics_flags) + " ethics flag")
+        if grade_below_a(halal_grade):
+            sell_reasons.append(f"halal rating downgraded to {halal_grade}")
         rows.append({
             "ticker": ticker,
             "compliance": overall,
@@ -159,7 +188,9 @@ def compute_rows(holdings, prices):
             "value": value,
             "pct": pct if len(holdings) > 1 else Decimal("100"),
             "over_concentrated": over_concentrated,
-            "ethics_flags": check_ethics_flags(ticker),
+            "ethics_flags": ethics_flags,
+            "halal_grade": halal_grade,
+            "sell_reasons": sell_reasons,
         })
         time.sleep(1)  # be polite — one fetch per ticker per week per source
     return rows, total_value
@@ -170,6 +201,7 @@ def render_text(rows, total_value):
     flagged_compliance = [r for r in rows if r["compliance"] != COMPLIANT]
     flagged_concentration = [r for r in rows if r["over_concentrated"]]
     flagged_ethics = [r for r in rows if r["ethics_flags"]]
+    flagged_sell = [r for r in rows if r["sell_reasons"]]
 
     summary = []
     if flagged_compliance:
@@ -185,13 +217,23 @@ def render_text(rows, total_value):
                 f"{r['ticker']} ({'/'.join(f['type'] for f in r['ethics_flags'])})" for r in flagged_ethics
             )
         )
+    if flagged_sell:
+        summary.append("CONSIDER SELLING: " + ", ".join(r["ticker"] for r in flagged_sell))
     if not summary:
         summary.append("Nothing flagged this week.")
     lines.append("\n".join(summary))
 
+    if flagged_sell:
+        lines.append("\n=== Consider selling ===\n")
+        for r in flagged_sell:
+            lines.append(f"{r['ticker']}: " + "; ".join(r["sell_reasons"]))
+        lines.append(
+            "This is not a sell order — it never places one. Review and sell manually in Binance if you agree."
+        )
+
     lines.append("\n=== Sharia compliance re-check ===\n")
     for r in rows:
-        lines.append(f"{r['ticker']}: {r['compliance']}")
+        lines.append(f"{r['ticker']}: {r['compliance']} | halal rating: {r['halal_grade']}")
         for name, (status, url, detail) in r["sources"].items():
             lines.append(f"    {name}: {status} ({detail}) — {url}")
         lines.append("    manual cross-check: " + " | ".join(MANUAL_LINKS))
@@ -210,6 +252,7 @@ def render_html(rows, total_value):
     flagged_compliance = [r for r in rows if r["compliance"] != COMPLIANT]
     flagged_concentration = [r for r in rows if r["over_concentrated"]]
     flagged_ethics = [r for r in rows if r["ethics_flags"]]
+    flagged_sell = [r for r in rows if r["sell_reasons"]]
 
     def badge(status):
         return (
@@ -241,7 +284,19 @@ def render_html(rows, total_value):
                 for r in flagged_ethics
             )
         )
+    if flagged_sell:
+        summary_parts.append(
+            "<b>Consider selling:</b> " + ", ".join(f"\U0001f6ab {escape(r['ticker'])}" for r in flagged_sell)
+        )
     summary_html = "<br>".join(summary_parts) if summary_parts else "✅ Nothing flagged this week."
+
+    def sell_row(r):
+        return (
+            "<tr>"
+            f'<td style="padding:8px;border-bottom:1px solid #d0d7de;font-weight:600;">{escape(r["ticker"])}</td>'
+            f'<td style="padding:8px;border-bottom:1px solid #d0d7de;">{escape("; ".join(r["sell_reasons"]))}</td>'
+            "</tr>"
+        )
 
     def compliance_row(r):
         sources_html = "<br>".join(
@@ -257,6 +312,7 @@ def render_html(rows, total_value):
             "<tr>"
             f'<td style="padding:8px;border-bottom:1px solid #d0d7de;font-weight:600;">{escape(r["ticker"])}</td>'
             f'<td style="padding:8px;border-bottom:1px solid #d0d7de;">{badge(r["compliance"])}</td>'
+            f'<td style="padding:8px;border-bottom:1px solid #d0d7de;">{escape(r["halal_grade"])}</td>'
             f'<td style="padding:8px;border-bottom:1px solid #d0d7de;font-size:12px;">{sources_html}{ethics_html}</td>'
             "</tr>"
         )
@@ -273,16 +329,35 @@ def render_html(rows, total_value):
 
     manual_links_html = " | ".join(f'<a href="{u}" style="color:#57606a;">{escape(u)}</a>' for u in MANUAL_LINKS)
 
+    sell_section = ""
+    if flagged_sell:
+        sell_section = f"""
+  <h3 style="margin-top:24px;">Consider selling</h3>
+  <table style="width:100%;border-collapse:collapse;font-size:14px;">
+    <thead>
+      <tr style="background:#f6f8fa;text-align:left;">
+        <th style="padding:8px;border-bottom:2px solid #d0d7de;">Ticker</th>
+        <th style="padding:8px;border-bottom:2px solid #d0d7de;">Why</th>
+      </tr>
+    </thead>
+    <tbody>
+      {"".join(sell_row(r) for r in flagged_sell)}
+    </tbody>
+  </table>
+  <p style="font-size:12px;color:#57606a;">This is not a sell order — it never places one. Review and sell manually in Binance if you agree.</p>
+"""
+
     return f"""\
 <div style="font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;color:#1f2328;background:#ffffff;max-width:680px;padding:16px;">
   <p style="font-size:15px;">{summary_html}</p>
-
+  {sell_section}
   <h3 style="margin-top:24px;">Sharia compliance re-check</h3>
   <table style="width:100%;border-collapse:collapse;font-size:14px;">
     <thead>
       <tr style="background:#f6f8fa;text-align:left;">
         <th style="padding:8px;border-bottom:2px solid #d0d7de;">Ticker</th>
         <th style="padding:8px;border-bottom:2px solid #d0d7de;">Overall</th>
+        <th style="padding:8px;border-bottom:2px solid #d0d7de;">Halal rating</th>
         <th style="padding:8px;border-bottom:2px solid #d0d7de;">Sources</th>
       </tr>
     </thead>

@@ -6,9 +6,10 @@ description: Run, debug, or extend the weekly halal portfolio review (weekly_por
 # Halal portfolio review
 
 Read-only pipeline: re-checks current Binance equity holdings for Sharia
-compliance, flags concentration risk and other ethics-screen exposure, and
-emails a shortlist of A/A+-rated candidate stocks & ETFs. It never places an
-order.
+compliance and halal letter grade, flags concentration risk and other
+ethics-screen exposure, rolls worsened holdings into a "Consider selling"
+list, and emails a shortlist of A/A+-rated candidate stocks & ETFs. It never
+places an order.
 Full architecture is in [README.md](../../../README.md) — read that first for
 file layout and the self-hosted-runner requirement; this skill covers the
 parts that aren't already legible from the code.
@@ -58,6 +59,15 @@ paths still print a note and continue.
   `COMPLIANT` — any fetch failure, page-structure mismatch, or disagreement
   between the two surfaces as `UNKNOWN` by design (fail toward "check this
   yourself," never toward a false-positive "compliant").
+- **A holding is missing from "Consider selling" despite a bad grade, or
+  vice versa**: `grade_below_a` in `musaffa_recommendations.py` treats
+  `UNKNOWN` as not-a-downgrade on purpose — a scrape timeout isn't a real
+  signal. `get_halal_grades` doesn't know if a held ticker is a stock or an
+  ETF (Binance's holdings response doesn't say), so it tries
+  `musaffa.com/stock/<TICKER>` first and only falls back to `/etf/<TICKER>`
+  on an `UNKNOWN` result — if that ordering ever picks the wrong page for a
+  ticker that coincidentally resolves on both paths, fix the fallback logic
+  there.
 
 ## Updating the ethics-screen lists
 

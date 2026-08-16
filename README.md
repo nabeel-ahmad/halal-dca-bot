@@ -1,12 +1,13 @@
 # Halal Portfolio Weekly Review
 
 This is a small helper that checks your Binance stock/ETF portfolio once a
-week and emails you a report. It looks at three things: whether your
-holdings are still Sharia-compliant, whether you're too concentrated in any
-one stock, and whether anything you own trips a couple of extra ethics
-checks. It also suggests a few new Sharia-compliant stocks and ETFs you could
-add. **It only reads your account and sends an email — it never buys or
-sells anything for you.**
+week and emails you a report. It looks at whether your holdings are still
+Sharia-compliant, whether you're too concentrated in any one stock, and
+whether anything you own trips a couple of extra ethics checks — and rolls
+those into a "Consider selling" list when a holding's compliance status,
+ethics flags, or halal letter grade have gotten worse. It also suggests a few
+new Sharia-compliant stocks and ETFs you could add. **It only reads your
+account and sends an email — it never buys or sells anything for you.**
 
 **This is not financial advice.** It just applies a fixed, mechanical set of
 rules every week (a screener filter you picked, a cash target, some
@@ -17,7 +18,7 @@ suggests aren't a recommendation to actually buy them.
 
 | File | Purpose |
 |---|---|
-| `weekly_portfolio_review.py` | Entry point. Re-checks current holdings' Sharia compliance (Musaffa + Zoya), flags concentration risk and additional ethics screens, and emails a shortlist of A/A+-rated candidate stocks & ETFs matching a Musaffa screener filter, with a mechanical $ split of idle cash. |
+| `weekly_portfolio_review.py` | Entry point. Re-checks current holdings' Sharia compliance (Musaffa + Zoya) and halal letter grade, flags concentration risk and additional ethics screens, surfaces a "Consider selling" list, and emails a shortlist of A/A+-rated candidate stocks & ETFs matching a Musaffa screener filter, with a mechanical $ split of idle cash. |
 | `binance_equity.py` | Binance Stocks Trading API client (signed requests, holdings, prices) + SMTP sender, shared by the review script. |
 | `musaffa_recommendations.py` | Headless-browser (Playwright) scraper for the Musaffa screener and per-ticker Halal Rating grade — the screener table is JS-rendered, so a plain HTTP request won't see it. |
 | `ethics_screens.py` | Small, manually-curated reference lists used to warn on existing holdings and exclude from new candidates — see inline comments in the file for sourcing. |
@@ -51,6 +52,26 @@ instead. That means:
    withdrawals and margin/futures off. This project never places orders, so
    even read-only permission is enough if Binance offers it.
 3. SMTP: an app password (e.g. Gmail), not your real account password.
+
+## Consider-selling list
+
+Each week, every current holding is re-checked and flagged for the "Consider
+selling" list if any of these have changed since you bought it:
+
+- **Compliance**: it's no longer Sharia-compliant (Musaffa/Zoya disagree with
+  its original COMPLIANT status).
+- **Ethics**: it now trips one of the ethics screens below.
+- **Halal rating**: its Musaffa letter grade has dropped below A (A- or
+  lower).
+
+This list is informational only — nothing is ever sold automatically; you
+still make the call and sell manually in Binance if you agree.
+
+Analyst rating is **not** part of this list for existing holdings: Musaffa
+only exposes an analyst-consensus rating through its screener results, which
+only covers a filtered subset of tickers, not an arbitrary ticker you already
+hold. It's still used (and shown) for this week's new-money candidates, since
+those come directly from the screener.
 
 ## Ethics screens
 

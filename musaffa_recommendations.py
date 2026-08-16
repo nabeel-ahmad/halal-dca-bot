@@ -68,6 +68,34 @@ def _scrape_rows(url, timeout_ms=20000):
     return [r for r in rows if r and r[0:1] != ["No Data"] and len(r) > 1]
 
 
+GRADE_RANK = {"A+": 0, "A": 1, "A-": 2, "B+": 3, "B": 4, "B-": 5, "C+": 6, "C": 7, "C-": 8, "D+": 9, "D": 10, "D-": 11}
+
+
+def grade_below_a(grade):
+    """True if grade is a recognized letter grade below 'A' (A- or lower).
+    UNKNOWN/unrecognized grades return False — a scrape failure isn't a
+    downgrade signal."""
+    return GRADE_RANK.get(grade, -1) > GRADE_RANK["A"]
+
+
+def _read_grade(page, url, timeout_ms=20000):
+    """Loads a Musaffa detail page and polls for its Halal Rating letter
+    grade. The "Screening Methodology" label renders before the grade
+    itself, which arrives via a separate async call — poll instead of
+    waiting on a fixed delay or on the label alone."""
+    try:
+        page.goto(url, wait_until="networkidle", timeout=timeout_ms)
+        for _ in range(20):
+            text = page.inner_text("body")
+            m = GRADE_RE.search(text)
+            if m:
+                return m.group(1).upper()
+            page.wait_for_timeout(1000)
+    except Exception:
+        pass
+    return "UNKNOWN"
+
+
 def enrich_with_halal_grade(picks, timeout_ms=20000):
     """Adds a 'halal_grade' field (e.g. "A+") to each pick by loading its own
     detail page. One browser, one page per ticker — fine for the ~10 picks
@@ -78,26 +106,32 @@ def enrich_with_halal_grade(picks, timeout_ms=20000):
             page = browser.new_page()
             for pick in picks:
                 path = "etf" if pick["asset_type"] == "etf" else "stock"
-                url = f"https://musaffa.com/{path}/{pick['ticker']}"
-                try:
-                    page.goto(url, wait_until="networkidle", timeout=timeout_ms)
-                    # The "Screening Methodology" label renders before the grade
-                    # itself, which arrives via a separate async call — poll
-                    # instead of waiting on a fixed delay or on the label alone.
-                    grade = None
-                    for _ in range(20):
-                        text = page.inner_text("body")
-                        m = GRADE_RE.search(text)
-                        if m:
-                            grade = m.group(1).upper()
-                            break
-                        page.wait_for_timeout(1000)
-                    pick["halal_grade"] = grade or "UNKNOWN"
-                except Exception:
-                    pick["halal_grade"] = "UNKNOWN"
+                pick["halal_grade"] = _read_grade(page, f"https://musaffa.com/{path}/{pick['ticker']}", timeout_ms)
         finally:
             browser.close()
     return picks
+
+
+def get_halal_grades(tickers, timeout_ms=20000):
+    """tickers: iterable of tickers held (asset type unknown — Binance's
+    holdings response doesn't distinguish stock vs ETF). Tries the /stock/
+    detail page first, falling back to /etf/ if that comes back UNKNOWN.
+    Returns {ticker: grade}, one browser for the whole batch. Used to
+    re-check existing holdings for a grade downgrade, not just new
+    candidates."""
+    grades = {}
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        try:
+            page = browser.new_page()
+            for ticker in tickers:
+                grade = _read_grade(page, f"https://musaffa.com/stock/{ticker}", timeout_ms)
+                if grade == "UNKNOWN":
+                    grade = _read_grade(page, f"https://musaffa.com/etf/{ticker}", timeout_ms)
+                grades[ticker] = grade
+        finally:
+            browser.close()
+    return grades
 
 
 def _parse_name_cell(cell):
