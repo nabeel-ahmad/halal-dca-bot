@@ -45,11 +45,17 @@ paths still print a note and continue.
 - **A pick's `halal_grade` is `UNKNOWN`**: this is the single most flaky part
   of the pipeline. Musaffa's per-ticker page renders the "Screening
   Methodology" label before the grade itself arrives via a separate async
-  call — `enrich_with_halal_grade` in `musaffa_recommendations.py` polls for
-  up to 20s per ticker, but the site is occasionally slower than that. An
-  `UNKNOWN` grade is a scrape timeout, not a real "no grade" signal — the
-  email links each one to `musaffa.com/stock/<TICKER>` (or `/etf/<TICKER>`)
-  to check by hand. Raise `range(20)` in that function if this fires often.
+  call — `_read_grade` in `musaffa_recommendations.py` polls for up to
+  `GRADE_POLL_ATTEMPTS` seconds (8, tuned down from an original 20 for
+  speed), but the site is occasionally slower than that. An `UNKNOWN` grade
+  is a scrape timeout, not a real "no grade" signal — the email links each
+  one to `musaffa.com/stock/<TICKER>` (or `/etf/<TICKER>`) to check by hand.
+  Raise `GRADE_POLL_ATTEMPTS` if this fires often; that's the speed/reliability
+  knob for the whole grade-fetching path. Grade lookups for both new
+  candidates (`enrich_with_halal_grade`) and existing holdings
+  (`get_halal_grades`) run several tickers concurrently (`GRADE_FETCH_WORKERS`,
+  default 5) — each worker thread opens its own Playwright browser, since the
+  sync API isn't safe to share across threads.
 - **Candidate list looks empty or wrong**: the discovery filter is a literal
   URL (`STOCK_SCREENER_URL` / `ETF_SCREENER_URL` in
   `musaffa_recommendations.py`), not a live UI interaction — if Musaffa
@@ -62,7 +68,12 @@ paths still print a note and continue.
   between sources surfaces as `UNKNOWN` by design (fail toward "check this
   yourself," never toward a false-positive "compliant"). Sources run in
   parallel via a `ThreadPoolExecutor`, so one slow source doesn't add to the
-  others' latency.
+  others' latency, and tickers themselves are processed
+  `TICKER_FETCH_WORKERS`-at-a-time (default 5) rather than one after another.
+  `HTTP_TIMEOUT` (10s) is the ceiling per request — lower it further if a
+  run is timing out rather than erroring, higher if a source starts
+  returning more `UNKNOWN`s after this change (that's the fetch failing
+  before the real page load completes, not a real compliance signal).
 - **Halal Terminal always shows `UNKNOWN` / "not set — skipped"**:
   `HALAL_TERMINAL_API_KEY` isn't set in this environment, so
   `check_compliance` doesn't include it at all (see `if

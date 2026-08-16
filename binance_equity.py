@@ -20,10 +20,14 @@ import hmac
 import os
 import smtplib
 import time
+from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal
 from email.mime.text import MIMEText
 
 import requests
+
+HTTP_TIMEOUT = 10
+PRICE_FETCH_WORKERS = 8
 
 BINANCE_API_KEY = os.environ.get("BINANCE_API_KEY", "")
 BINANCE_API_SECRET = os.environ.get("BINANCE_API_SECRET", "")
@@ -49,27 +53,32 @@ def _binance_signed_request(method, path, params):
     query = "&".join(f"{k}={v}" for k, v in params.items())
     signature = hmac.new(BINANCE_API_SECRET.encode(), query.encode(), hashlib.sha256).hexdigest()
     url = f"{BINANCE_BASE_URL}{path}?{query}&signature={signature}"
-    resp = requests.request(method, url, headers={"X-MBX-APIKEY": BINANCE_API_KEY}, timeout=15)
+    resp = requests.request(method, url, headers={"X-MBX-APIKEY": BINANCE_API_KEY}, timeout=HTTP_TIMEOUT)
     resp.raise_for_status()
     return resp.json()
 
 
+def _fetch_quote(ticker):
+    resp = requests.get(
+        f"{BINANCE_BASE_URL}/sapi/v1/equity/market/quote",
+        headers={"X-MBX-APIKEY": BINANCE_API_KEY},
+        params={"symbol": ticker},
+        timeout=HTTP_TIMEOUT,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    if not data:
+        raise RuntimeError(f"No quote available for {ticker}")
+    return ticker, (Decimal(data["bidPrice"]) + Decimal(data["askPrice"])) / 2
+
+
 def get_current_prices(tickers):
-    """Latest bid/ask quote per ticker (MARKET_DATA, API key only, no signature)."""
-    prices = {}
-    for ticker in tickers:
-        resp = requests.get(
-            f"{BINANCE_BASE_URL}/sapi/v1/equity/market/quote",
-            headers={"X-MBX-APIKEY": BINANCE_API_KEY},
-            params={"symbol": ticker},
-            timeout=15,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        if not data:
-            raise RuntimeError(f"No quote available for {ticker}")
-        prices[ticker] = (Decimal(data["bidPrice"]) + Decimal(data["askPrice"])) / 2
-    return prices
+    """Latest bid/ask quote per ticker (MARKET_DATA, API key only, no
+    signature), fetched concurrently — one HTTP round-trip per ticker,
+    otherwise serialized needlessly."""
+    tickers = list(tickers)
+    with ThreadPoolExecutor(max_workers=min(PRICE_FETCH_WORKERS, len(tickers) or 1)) as pool:
+        return dict(pool.map(_fetch_quote, tickers))
 
 
 def get_account_holdings():

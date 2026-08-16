@@ -18,7 +18,7 @@ suggests aren't a recommendation to actually buy them.
 
 | File | Purpose |
 |---|---|
-| `weekly_portfolio_review.py` | Entry point. Re-checks current holdings' Sharia compliance (Musaffa + Zoya + optional Halal Terminal, checked in parallel) and halal letter grade, flags concentration risk and additional ethics screens, surfaces a "Consider selling" list, and emails a shortlist of A/A+-rated candidate stocks & ETFs matching a Musaffa screener filter, with a mechanical $ split of idle cash. |
+| `weekly_portfolio_review.py` | Entry point. Re-checks current holdings' Sharia compliance (Musaffa + optional Halal Terminal, checked in parallel) and halal letter grade, flags concentration risk and additional ethics screens, surfaces a "Consider selling" list, and emails a shortlist of A/A+-rated candidate stocks & ETFs matching a Musaffa screener filter, with a mechanical $ split of idle cash. |
 | `binance_equity.py` | Binance Stocks Trading API client (signed requests, holdings, prices) + SMTP sender, shared by the review script. |
 | `musaffa_recommendations.py` | Headless-browser (Playwright) scraper for the Musaffa screener and per-ticker Halal Rating grade — the screener table is JS-rendered, so a plain HTTP request won't see it. |
 | `ethics_screens.py` | Small, manually-curated reference lists used to warn on existing holdings and exclude from new candidates — see inline comments in the file for sourcing. |
@@ -55,7 +55,7 @@ instead. That means:
 4. Optional — a third compliance source: sign up yourself at
    halalterminal.com for a free-tier API key, then add it as the
    `HALAL_TERMINAL_API_KEY` repo secret (and/or your local `.env`). Leave it
-   unset and the review just runs on Musaffa + Zoya as before.
+   unset and the review just runs on Musaffa alone as before.
 
 ## Consider-selling list
 

@@ -22,8 +22,11 @@ resulting URL.
 """
 
 import re
+from concurrent.futures import ThreadPoolExecutor
 
 from playwright.sync_api import sync_playwright
+
+GRADE_FETCH_WORKERS = 5
 
 STOCK_SCREENER_URL = (
     "https://musaffa.com/stock-screener/?country=US&page=1"
@@ -51,7 +54,7 @@ ANALYST_RANK = {"strong buy": 0, "buy": 1, "hold": 2, "sell": 3, "strong sell": 
 GRADE_RE = re.compile(r"Screening Methodology:\s*AAOIFI\s*\n+\s*(?:HALAL|NOT HALAL)\s*\n+\s*([A-D][+-]?|-)", re.I)
 
 
-def _scrape_rows(url, timeout_ms=20000):
+def _scrape_rows(url, timeout_ms=15000):
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         try:
@@ -78,14 +81,18 @@ def grade_below_a(grade):
     return GRADE_RANK.get(grade, -1) > GRADE_RANK["A"]
 
 
-def _read_grade(page, url, timeout_ms=20000):
+GRADE_POLL_ATTEMPTS = 8  # ~8s max poll after page load — was 20s; trades a bit
+                         # more scrape-timeout risk (-> UNKNOWN) for speed.
+
+
+def _read_grade(page, url, timeout_ms=12000):
     """Loads a Musaffa detail page and polls for its Halal Rating letter
     grade. The "Screening Methodology" label renders before the grade
     itself, which arrives via a separate async call — poll instead of
     waiting on a fixed delay or on the label alone."""
     try:
         page.goto(url, wait_until="networkidle", timeout=timeout_ms)
-        for _ in range(20):
+        for _ in range(GRADE_POLL_ATTEMPTS):
             text = page.inner_text("body")
             m = GRADE_RE.search(text)
             if m:
@@ -96,42 +103,50 @@ def _read_grade(page, url, timeout_ms=20000):
     return "UNKNOWN"
 
 
-def enrich_with_halal_grade(picks, timeout_ms=20000):
-    """Adds a 'halal_grade' field (e.g. "A+") to each pick by loading its own
-    detail page. One browser, one page per ticker — fine for the ~10 picks
-    this runs against, not meant for scanning the whole screener."""
+def _fetch_grade_standalone(url, timeout_ms=12000):
+    """Own Playwright instance + browser, for use from a worker thread —
+    the sync API is only safe to use from the thread that created it, so
+    each parallel fetch gets its own instead of sharing one page/browser."""
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         try:
-            page = browser.new_page()
-            for pick in picks:
-                path = "etf" if pick["asset_type"] == "etf" else "stock"
-                pick["halal_grade"] = _read_grade(page, f"https://musaffa.com/{path}/{pick['ticker']}", timeout_ms)
+            return _read_grade(browser.new_page(), url, timeout_ms)
         finally:
             browser.close()
+
+
+def enrich_with_halal_grade(picks, timeout_ms=12000, max_workers=GRADE_FETCH_WORKERS):
+    """Adds a 'halal_grade' field (e.g. "A+") to each pick by loading its own
+    detail page, fetched concurrently (one browser per worker thread) —
+    fine for the ~10 picks this runs against, not meant for scanning the
+    whole screener."""
+    urls = [
+        f"https://musaffa.com/{'etf' if p['asset_type'] == 'etf' else 'stock'}/{p['ticker']}"
+        for p in picks
+    ]
+    with ThreadPoolExecutor(max_workers=min(max_workers, len(picks) or 1)) as pool:
+        grades = list(pool.map(lambda u: _fetch_grade_standalone(u, timeout_ms), urls))
+    for pick, grade in zip(picks, grades):
+        pick["halal_grade"] = grade
     return picks
 
 
-def get_halal_grades(tickers, timeout_ms=20000):
+def get_halal_grades(tickers, timeout_ms=12000, max_workers=GRADE_FETCH_WORKERS):
     """tickers: iterable of tickers held (asset type unknown — Binance's
     holdings response doesn't distinguish stock vs ETF). Tries the /stock/
     detail page first, falling back to /etf/ if that comes back UNKNOWN.
-    Returns {ticker: grade}, one browser for the whole batch. Used to
-    re-check existing holdings for a grade downgrade, not just new
-    candidates."""
-    grades = {}
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        try:
-            page = browser.new_page()
-            for ticker in tickers:
-                grade = _read_grade(page, f"https://musaffa.com/stock/{ticker}", timeout_ms)
-                if grade == "UNKNOWN":
-                    grade = _read_grade(page, f"https://musaffa.com/etf/{ticker}", timeout_ms)
-                grades[ticker] = grade
-        finally:
-            browser.close()
-    return grades
+    Fetched concurrently (one browser per worker thread). Used to re-check
+    existing holdings for a grade downgrade, not just new candidates."""
+    tickers = list(tickers)
+
+    def fetch(ticker):
+        grade = _fetch_grade_standalone(f"https://musaffa.com/stock/{ticker}", timeout_ms)
+        if grade == "UNKNOWN":
+            grade = _fetch_grade_standalone(f"https://musaffa.com/etf/{ticker}", timeout_ms)
+        return ticker, grade
+
+    with ThreadPoolExecutor(max_workers=min(max_workers, len(tickers) or 1)) as pool:
+        return dict(pool.map(fetch, tickers))
 
 
 def _parse_name_cell(cell):

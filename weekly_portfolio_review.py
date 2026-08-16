@@ -7,13 +7,15 @@ Binance equity holdings:
   1. Sharia compliance re-check, against your trusted sources, all queried
      in parallel:
        - Musaffa (musaffa.com/stock/<TICKER>) — scraped
-       - Zoya (zoya.finance/stocks/<ticker>) — scraped
        - Halal Terminal (api.halalterminal.com) — real API, only checked if
          HALAL_TERMINAL_API_KEY is set (sign up yourself for a key; this
          project never creates accounts or handles credentials for you)
-     Hyssa blocks non-browser requests (403) and Islamic Finance Guru
-     charges per-ticker screening, so both are only linked for manual
-     cross-check, not scraped.
+     Zoya was dropped as an automated source — its scrape stopped reliably
+     matching the page (near-constant UNKNOWN), for reasons that could be a
+     layout change, bot detection, or regional rendering; it's still linked
+     for manual cross-check. Hyssa blocks non-browser requests (403) and
+     Islamic Finance Guru charges per-ticker screening, so both are also
+     only linked for manual cross-check, not scraped.
      Any fetch failure, unrecognized page structure, or disagreement
      between sources is reported as UNKNOWN, not silently skipped — this
      is exactly the case you'd want a human to look at.
@@ -43,7 +45,6 @@ import os
 import re
 import smtplib
 import sys
-import time
 from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal, ROUND_HALF_UP
 from email.mime.multipart import MIMEMultipart
@@ -80,7 +81,7 @@ CASH_RESERVE_TARGET_USD = Decimal(os.environ.get("CASH_RESERVE_TARGET_USD", "500
 NUM_STOCK_PICKS = int(os.environ.get("NUM_STOCK_PICKS", "7"))
 NUM_ETF_PICKS = int(os.environ.get("NUM_ETF_PICKS", "3"))
 HALAL_TERMINAL_API_KEY = os.environ.get("HALAL_TERMINAL_API_KEY", "")
-HTTP_TIMEOUT = 15
+HTTP_TIMEOUT = 10
 USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
@@ -117,28 +118,6 @@ def check_musaffa(ticker):
     return UNKNOWN, url, f"unrecognized status text: {status!r}"
 
 
-def check_zoya(ticker):
-    """zoya.finance/stocks/<ticker> — '<TICKER> stock is (not )?Shariah-compliant'."""
-    url = f"https://zoya.finance/stocks/{ticker.lower()}"
-    try:
-        resp = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=HTTP_TIMEOUT)
-        resp.raise_for_status()
-    except requests.RequestException as e:
-        return UNKNOWN, url, f"fetch failed: {e}"
-
-    if ticker.upper() not in resp.text.upper():
-        return UNKNOWN, url, "ticker not found on page"
-
-    m = re.search(
-        rf"{re.escape(ticker)}\s+stock is\s*(?:&nbsp;|\s)*(?:<[^>]+>)*\s*(not\s+)?Shariah-compliant",
-        resp.text,
-        re.I,
-    )
-    if not m:
-        return UNKNOWN, url, "compliance phrase not found"
-    return (NON_COMPLIANT if m.group(1) else COMPLIANT), url, ("not Shariah-compliant" if m.group(1) else "Shariah-compliant")
-
-
 def check_halal_terminal(ticker):
     """api.halalterminal.com/api/screen/<TICKER> — real JSON API (not a
     scrape), screening against AAOIFI/DJIM/FTSE/MSCI/S&P simultaneously.
@@ -163,16 +142,24 @@ def check_halal_terminal(ticker):
     except (requests.RequestException, ValueError) as e:
         return UNKNOWN, url, f"fetch failed: {e}"
 
+    # shariah_compliance_status is null on some cached rows (per the API's own
+    # schema notes) — is_compliant is the boolean field that's actually
+    # populated then, so fall back to it before giving up as UNKNOWN.
     status = data.get("shariah_compliance_status")
     if status == "compliant":
         return COMPLIANT, url, status
     if status == "non_compliant":
         return NON_COMPLIANT, url, status
+    is_compliant = data.get("is_compliant")
+    if is_compliant is True:
+        return COMPLIANT, url, "is_compliant=true"
+    if is_compliant is False:
+        return NON_COMPLIANT, url, "is_compliant=false"
     return UNKNOWN, url, data.get("error_message") or status or "insufficient data"
 
 
 def check_compliance(ticker):
-    checks = {"musaffa": check_musaffa, "zoya": check_zoya}
+    checks = {"musaffa": check_musaffa}
     if HALAL_TERMINAL_API_KEY:
         checks["halal_terminal"] = check_halal_terminal
     with ThreadPoolExecutor(max_workers=len(checks)) as pool:
@@ -199,9 +186,15 @@ MANUAL_LINKS = (
 )
 
 
+TICKER_FETCH_WORKERS = 5
+
+
 def compute_rows(holdings, prices):
     """One pass over holdings: compliance check + weight/concentration, in a
-    single structured form both the text and HTML renderers read from."""
+    single structured form both the text and HTML renderers read from.
+    Tickers are processed concurrently — compliance/grade checks are one
+    HTTP or headless-browser round-trip per ticker per source, otherwise
+    serialized needlessly."""
     total_value = sum(qty * prices[t] for t, qty in holdings.items())
     try:
         halal_grades = get_halal_grades(holdings)
@@ -209,8 +202,8 @@ def compute_rows(holdings, prices):
         print(f"Note: couldn't pull halal grades for holdings: {e}", file=sys.stderr)
         halal_grades = {}
 
-    rows = []
-    for ticker, qty in sorted(holdings.items(), key=lambda kv: -(kv[1] * prices[kv[0]])):
+    def build_row(item):
+        ticker, qty = item
         overall, sources = check_compliance(ticker)
         value = qty * prices[ticker]
         pct = (value / total_value * 100).quantize(Decimal("0.1"), rounding=ROUND_HALF_UP) if total_value else Decimal("0")
@@ -224,7 +217,7 @@ def compute_rows(holdings, prices):
             sell_reasons.append("/".join(f["type"] for f in ethics_flags) + " ethics flag")
         if grade_below_a(halal_grade):
             sell_reasons.append(f"halal rating downgraded to {halal_grade}")
-        rows.append({
+        return {
             "ticker": ticker,
             "compliance": overall,
             "sources": sources,
@@ -234,8 +227,11 @@ def compute_rows(holdings, prices):
             "ethics_flags": ethics_flags,
             "halal_grade": halal_grade,
             "sell_reasons": sell_reasons,
-        })
-        time.sleep(1)  # be polite — one fetch per ticker per week per source
+        }
+
+    items = sorted(holdings.items(), key=lambda kv: -(kv[1] * prices[kv[0]]))
+    with ThreadPoolExecutor(max_workers=min(TICKER_FETCH_WORKERS, len(items) or 1)) as pool:
+        rows = list(pool.map(build_row, items))
     return rows, total_value
 
 
