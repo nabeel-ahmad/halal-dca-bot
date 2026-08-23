@@ -31,3 +31,28 @@ jobs:
           except Exception as e:
               print('ERROR:', repr(e))
           "
+
+      - name: Probe for a symbols/instruments listing endpoint
+        env:
+          BINANCE_API_KEY: ${{ secrets.BINANCE_API_KEY }}
+          BINANCE_API_SECRET: ${{ secrets.BINANCE_API_SECRET }}
+        run: |
+          /Users/hk-nabeel/.venvs/halal-dca-bot/bin/python3 -c "
+          import os, requests
+          key = os.environ['BINANCE_API_KEY']
+          paths = [
+              '/sapi/v1/equity/market/symbols',
+              '/sapi/v1/equity/market/instruments',
+              '/sapi/v1/equity/market/exchangeInfo',
+              '/sapi/v1/equity/instruments',
+              '/sapi/v1/equity/symbols',
+              '/sapi/v1/equity/trade/tradableSymbols',
+              '/sapi/v1/equity/asset/list',
+          ]
+          for p in paths:
+              try:
+                  r = requests.get('https://api.binance.com' + p, headers={'X-MBX-APIKEY': key}, timeout=10)
+                  print(p, '->', r.status_code, r.text[:300])
+              except Exception as e:
+                  print(p, '-> ERROR', repr(e))
+          "
