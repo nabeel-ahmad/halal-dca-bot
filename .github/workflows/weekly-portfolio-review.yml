@@ -22,7 +22,12 @@ name: Weekly Portfolio Review
 on:
   schedule:
     - cron: "0 5 * * 0"
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Render the digest but don't send the email"
+        type: boolean
+        default: false
 
 jobs:
   review:
@@ -43,4 +48,12 @@ jobs:
           EMAIL_TO: ${{ secrets.EMAIL_TO }}
           HALAL_TERMINAL_API_KEY: ${{ secrets.HALAL_TERMINAL_API_KEY }}
           CONCENTRATION_WARN_PCT: "30"
+          DRY_RUN: ${{ inputs.dry_run && '1' || '' }}
         run: /Users/hk-nabeel/.venvs/halal-dca-bot/bin/python weekly_portfolio_review.py
+
+      - name: Upload digest preview
+        if: ${{ inputs.dry_run }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: digest-preview
+          path: digest_preview.html

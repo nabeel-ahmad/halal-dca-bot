@@ -35,8 +35,9 @@ Binance equity holdings:
   4. Candidate stocks/ETFs matching a Musaffa screener filter you specified
      (Sharia-compliant, rating A/A+, analyst Buy/Strong Buy), excluding
      anything on the BDS priority-boycott list or a major US DoD prime
-     contractor, with a mechanical $ split of idle cash above your reserve
-     target.
+     contractor and anything Halal Terminal flags NON_COMPLIANT (if
+     HALAL_TERMINAL_API_KEY is set), with a mechanical $ split of idle cash
+     above your reserve target.
 
 SECURITY: never hardcode credentials. Env vars pulled from binance_equity.py.
 """
@@ -175,6 +176,18 @@ def check_compliance(ticker):
     else:
         overall = UNKNOWN  # any disagreement or fetch failure — flag for manual review
     return overall, results
+
+
+def get_halal_terminal_non_compliant(tickers):
+    """Tickers Halal Terminal explicitly flags NON_COMPLIANT — used to screen
+    out new-money candidates, not just held positions. Returns empty if no
+    API key is set (no source to check, so nothing gets excluded on that basis)."""
+    if not HALAL_TERMINAL_API_KEY:
+        return set()
+    tickers = list(tickers)
+    with ThreadPoolExecutor(max_workers=min(TICKER_FETCH_WORKERS, len(tickers) or 1)) as pool:
+        results = pool.map(lambda t: (t, check_halal_terminal(t)[0]), tickers)
+    return {t for t, status in results if status == NON_COMPLIANT}
 
 
 SYMBOL = {COMPLIANT: "✅", NON_COMPLIANT: "❌", UNKNOWN: "⚠️"}
@@ -444,17 +457,22 @@ def compute_recommendations(stablecoin_balance):
     doesn't pick stocks by growth judgment — it reports what your own filter
     returns and does the arithmetic to keep cash under your target."""
     # Overfetch since some Musaffa candidates won't be tradable on Binance
-    # Stocks Trading; filtering those out shouldn't shrink the final count.
+    # Stocks Trading, or get flagged by Halal Terminal; filtering those out
+    # shouldn't shrink the final count.
     stocks = get_stock_candidates(NUM_STOCK_PICKS * 4, exclude_tickers=EXCLUDED_TICKERS)
     etfs = get_etf_candidates(NUM_ETF_PICKS * 4, exclude_tickers=EXCLUDED_TICKERS)
-    tradable = get_tradable_tickers({c["ticker"] for c in stocks + etfs})
-    stocks = [c for c in stocks if c["ticker"] in tradable][:NUM_STOCK_PICKS]
-    etfs = [c for c in etfs if c["ticker"] in tradable][:NUM_ETF_PICKS]
+    all_tickers = {c["ticker"] for c in stocks + etfs}
+    tradable = get_tradable_tickers(all_tickers)
+    non_compliant = get_halal_terminal_non_compliant(all_tickers)
+    keep = tradable - non_compliant
+    stocks = [c for c in stocks if c["ticker"] in keep][:NUM_STOCK_PICKS]
+    etfs = [c for c in etfs if c["ticker"] in keep][:NUM_ETF_PICKS]
     picks = [dict(p, asset_type="stock") for p in stocks] + [dict(p, asset_type="etf") for p in etfs]
     enrich_with_halal_grade(picks)
     for p in picks:
         path = "etf" if p["asset_type"] == "etf" else "stock"
         p["musaffa_url"] = f"https://musaffa.com/{path}/{p['ticker']}"
+        p["binance_url"] = f"https://www.binance.com/en/stocks/EQ_{p['ticker']}"
 
     investable = max(Decimal("0"), stablecoin_balance - CASH_RESERVE_TARGET_USD)
     per_asset = (investable / len(picks)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP) if picks else Decimal("0")
@@ -485,19 +503,22 @@ def render_recommendations_text(rec):
             lines.append(
                 f"[STOCK] {p['ticker']} — {p['name']} | halal rating: {grade_note} | "
                 f"analyst rating: {p['analyst_rating']} | "
-                f"sector: {p['sector']} | mkt cap: {p['market_cap']} | suggested: ${p['suggested_usd']:.2f}"
+                f"sector: {p['sector']} | mkt cap: {p['market_cap']} | suggested: ${p['suggested_usd']:.2f} | "
+                f"buy on Binance: {p['binance_url']}"
             )
         else:
             lines.append(
                 f"[ETF]   {p['ticker']} — {p['name']} | halal rating: {grade_note} | "
                 f"holdings: {p['num_holdings']} | "
-                f"segment: {p['segment']} | suggested: ${p['suggested_usd']:.2f}"
+                f"segment: {p['segment']} | suggested: ${p['suggested_usd']:.2f} | "
+                f"buy on Binance: {p['binance_url']}"
             )
     lines.append(
         "\nFilter applied (Musaffa screener): Sharia-compliant, Musaffa rating A/A+, "
         "analyst consensus Buy/Strong Buy (stocks) — sorted by number of holdings (ETFs). "
         "Also excludes anything on the BDS priority-boycott list or a major US DoD prime "
-        "contractor (see ethics_screens.py)."
+        "contractor (see ethics_screens.py), and anything Halal Terminal flags "
+        "NON_COMPLIANT" + ("" if HALAL_TERMINAL_API_KEY else " (skipped — HALAL_TERMINAL_API_KEY not set)") + "."
     )
     lines.append(
         "Binance has no API for marking favorites — favorite these manually in the app: "
@@ -523,9 +544,13 @@ def render_recommendations_html(rec):
         else:
             detail = f"{escape(p['segment'])} · {escape(p['num_holdings'])} holdings"
             type_badge = '<span style="background:#fbefff;color:#8250df;border-radius:4px;padding:2px 6px;font-size:12px;">ETF</span>'
+        ticker_cell = (
+            f'<a href="{escape(p["binance_url"])}" style="color:#1f2328;text-decoration:none;">'
+            f'{escape(p["ticker"])}</a>'
+        )
         return (
             "<tr>"
-            f'<td style="padding:8px;border-bottom:1px solid #d0d7de;font-weight:600;">{escape(p["ticker"])}</td>'
+            f'<td style="padding:8px;border-bottom:1px solid #d0d7de;font-weight:600;">{ticker_cell}</td>'
             f'<td style="padding:8px;border-bottom:1px solid #d0d7de;">{type_badge}</td>'
             f'<td style="padding:8px;border-bottom:1px solid #d0d7de;">{grade_badge(p)}</td>'
             f'<td style="padding:8px;border-bottom:1px solid #d0d7de;font-size:12px;">{escape(p["name"])}<br>{detail}</td>'
@@ -564,8 +589,9 @@ def render_recommendations_html(rec):
   <p style="font-size:12px;color:#57606a;">
     Filter applied (Musaffa screener): Sharia-compliant, Musaffa rating A/A+, analyst consensus
     Buy/Strong Buy (stocks) &mdash; sorted by number of holdings (ETFs). Also excludes anything
-    on the BDS priority-boycott list or a major US DoD prime contractor. Amounts split equally
-    across the {len(rec["picks"])} picks from whatever's above your cash reserve target.
+    on the BDS priority-boycott list or a major US DoD prime contractor, and anything Halal
+    Terminal flags NON_COMPLIANT{'' if HALAL_TERMINAL_API_KEY else ' (skipped &mdash; HALAL_TERMINAL_API_KEY not set)'}.
+    Amounts split equally across the {len(rec["picks"])} picks from whatever's above your cash reserve target.
   </p>
   <p style="font-size:12px;color:#9a6700;">
     Binance has no API for marking favorites &mdash; favorite these manually in the app: {favorite_list}
@@ -593,12 +619,15 @@ def main():
         print("Missing required environment variables/secrets. Aborting.", file=sys.stderr)
         sys.exit(1)
 
+    dry_run = os.environ.get("DRY_RUN") == "1"
+
     holdings = {t: q for t, q in get_account_holdings().items() if q > 0}
     if not holdings:
-        send_email_message(
-            "Weekly portfolio review — nothing held",
-            "No equity holdings found on Binance right now — nothing to review this week.",
-        )
+        message = "No equity holdings found on Binance right now — nothing to review this week."
+        if dry_run:
+            print(f"DRY_RUN=1 — would have sent: {message}")
+        else:
+            send_email_message("Weekly portfolio review — nothing held", message)
         return
 
     prices = get_current_prices(list(holdings))
@@ -615,6 +644,12 @@ def main():
         print(f"Note: couldn't build this week's candidate recommendations: {e}", file=sys.stderr)
         text_body += f"\n\n(Couldn't pull this week's halal candidates: {e})"
         html_body += f'<p style="color:#9a6700;">(Couldn\'t pull this week\'s halal candidates: {escape(str(e))})</p>'
+
+    if dry_run:
+        with open("digest_preview.html", "w") as f:
+            f.write(html_body)
+        print("DRY_RUN=1 — wrote digest_preview.html instead of sending email.")
+        return
 
     send_report_email("Weekly portfolio review", text_body, html_body)
 
