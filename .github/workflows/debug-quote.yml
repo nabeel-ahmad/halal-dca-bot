@@ -32,27 +32,22 @@ jobs:
               print('ERROR:', repr(e))
           "
 
-      - name: Probe for a symbols/instruments listing endpoint
+      - name: Inspect exchangeInfo entry for the ticker
         env:
           BINANCE_API_KEY: ${{ secrets.BINANCE_API_KEY }}
-          BINANCE_API_SECRET: ${{ secrets.BINANCE_API_SECRET }}
+          TICKER: ${{ inputs.ticker }}
         run: |
           /Users/hk-nabeel/.venvs/halal-dca-bot/bin/python3 -c "
-          import os, requests
+          import os, json, requests
           key = os.environ['BINANCE_API_KEY']
-          paths = [
-              '/sapi/v1/equity/market/symbols',
-              '/sapi/v1/equity/market/instruments',
-              '/sapi/v1/equity/market/exchangeInfo',
-              '/sapi/v1/equity/instruments',
-              '/sapi/v1/equity/symbols',
-              '/sapi/v1/equity/trade/tradableSymbols',
-              '/sapi/v1/equity/asset/list',
-          ]
-          for p in paths:
-              try:
-                  r = requests.get('https://api.binance.com' + p, headers={'X-MBX-APIKEY': key}, timeout=10)
-                  print(p, '->', r.status_code, r.text[:300])
-              except Exception as e:
-                  print(p, '-> ERROR', repr(e))
+          ticker = os.environ['TICKER']
+          r = requests.get('https://api.binance.com/sapi/v1/equity/market/exchangeInfo', headers={'X-MBX-APIKEY': key}, timeout=15)
+          data = r.json()
+          symbols = data.get('symbols', [])
+          print('total symbols:', len(symbols))
+          match = next((s for s in symbols if s.get('symbol') == ticker), None)
+          print(f'{ticker} entry:', json.dumps(match, indent=2) if match else 'NOT FOUND in exchangeInfo')
+          from collections import Counter
+          print('tradability value counts:', Counter(s.get('tradability') for s in symbols))
+          print('sample AAPL entry:', json.dumps(next((s for s in symbols if s.get('symbol') == 'AAPL'), None), indent=2))
           "
