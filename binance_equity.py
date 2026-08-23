@@ -82,23 +82,25 @@ def get_current_prices(tickers):
         return dict(pool.map(_fetch_quote, tickers))
 
 
-def _is_tradable(ticker):
-    try:
-        _fetch_quote(ticker)
-        return ticker, True
-    except (requests.RequestException, RuntimeError):
-        return ticker, False
-
-
 def get_tradable_tickers(tickers):
-    """Subset of tickers that Binance Stocks Trading actually quotes — a
-    ticker with no quote isn't buyable there even if Musaffa recommends it.
-    A quote failure just means "not tradable", not a fatal error, so
-    exceptions are swallowed per-ticker instead of propagating."""
-    tickers = list(tickers)
-    with ThreadPoolExecutor(max_workers=min(PRICE_FETCH_WORKERS, len(tickers) or 1)) as pool:
-        results = pool.map(_is_tradable, tickers)
-    return {ticker for ticker, tradable in results if tradable}
+    """Subset of tickers Binance Stocks Trading actually lets you buy/sell.
+
+    The per-ticker quote endpoint (/sapi/v1/equity/market/quote) is NOT a
+    valid tradability check — confirmed empirically that it returns a real
+    quote for tickers absent from Binance's own tradable catalog (e.g.
+    CHRN), so it must be pulling from a broader market-data feed than what's
+    actually buyable. The real source of truth is exchangeInfo's per-symbol
+    `tradability` field; only "BUY_SELL" means actually tradable."""
+    resp = requests.get(
+        f"{BINANCE_BASE_URL}/sapi/v1/equity/market/exchangeInfo",
+        headers={"X-MBX-APIKEY": BINANCE_API_KEY},
+        timeout=HTTP_TIMEOUT,
+    )
+    resp.raise_for_status()
+    tradable_all = {
+        s["symbol"] for s in resp.json().get("symbols", []) if s.get("tradability") == "BUY_SELL"
+    }
+    return tradable_all & set(tickers)
 
 
 def get_account_holdings():
