@@ -1,0 +1,34 @@
+\
+# Throwaway diagnostic — checks what /sapi/v1/equity/market/quote actually
+# returns for a given ticker. Delete after use.
+
+name: Debug Quote
+
+on:
+  workflow_dispatch:
+    inputs:
+      ticker:
+        description: "Ticker to check"
+        required: true
+
+jobs:
+  debug:
+    runs-on: [self-hosted, macOS, ARM64]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Query quote endpoint
+        env:
+          BINANCE_API_KEY: ${{ secrets.BINANCE_API_KEY }}
+          BINANCE_API_SECRET: ${{ secrets.BINANCE_API_SECRET }}
+          TICKER: ${{ inputs.ticker }}
+        run: |
+          /Users/hk-nabeel/.venvs/halal-dca-bot/bin/python3 -c "
+          import os
+          from binance_equity import _fetch_quote
+          ticker = os.environ['TICKER']
+          try:
+              print(_fetch_quote(ticker))
+          except Exception as e:
+              print('ERROR:', repr(e))
+          "
