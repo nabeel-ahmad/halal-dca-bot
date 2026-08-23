@@ -63,6 +63,7 @@ from binance_equity import (
     _binance_signed_request,
     get_account_holdings,
     get_current_prices,
+    get_tradable_tickers,
     send_email_message,
 )
 from ethics_screens import BDS_TARGETS, DOD_CONTRACTORS, check_ethics_flags
@@ -442,8 +443,13 @@ def compute_recommendations(stablecoin_balance):
     cash sits above CASH_RESERVE_TARGET_USD equally across the picks. This
     doesn't pick stocks by growth judgment — it reports what your own filter
     returns and does the arithmetic to keep cash under your target."""
-    stocks = get_stock_candidates(NUM_STOCK_PICKS, exclude_tickers=EXCLUDED_TICKERS)
-    etfs = get_etf_candidates(NUM_ETF_PICKS, exclude_tickers=EXCLUDED_TICKERS)
+    # Overfetch since some Musaffa candidates won't be tradable on Binance
+    # Stocks Trading; filtering those out shouldn't shrink the final count.
+    stocks = get_stock_candidates(NUM_STOCK_PICKS * 4, exclude_tickers=EXCLUDED_TICKERS)
+    etfs = get_etf_candidates(NUM_ETF_PICKS * 4, exclude_tickers=EXCLUDED_TICKERS)
+    tradable = get_tradable_tickers({c["ticker"] for c in stocks + etfs})
+    stocks = [c for c in stocks if c["ticker"] in tradable][:NUM_STOCK_PICKS]
+    etfs = [c for c in etfs if c["ticker"] in tradable][:NUM_ETF_PICKS]
     picks = [dict(p, asset_type="stock") for p in stocks] + [dict(p, asset_type="etf") for p in etfs]
     enrich_with_halal_grade(picks)
     for p in picks:

@@ -81,6 +81,25 @@ def get_current_prices(tickers):
         return dict(pool.map(_fetch_quote, tickers))
 
 
+def _is_tradable(ticker):
+    try:
+        _fetch_quote(ticker)
+        return ticker, True
+    except (requests.RequestException, RuntimeError):
+        return ticker, False
+
+
+def get_tradable_tickers(tickers):
+    """Subset of tickers that Binance Stocks Trading actually quotes — a
+    ticker with no quote isn't buyable there even if Musaffa recommends it.
+    A quote failure just means "not tradable", not a fatal error, so
+    exceptions are swallowed per-ticker instead of propagating."""
+    tickers = list(tickers)
+    with ThreadPoolExecutor(max_workers=min(PRICE_FETCH_WORKERS, len(tickers) or 1)) as pool:
+        results = pool.map(_is_tradable, tickers)
+    return {ticker for ticker, tradable in results if tradable}
+
+
 def get_account_holdings():
     """
     Binance's Stocks Trading API has no dedicated positions/balance endpoint
