@@ -11,8 +11,11 @@
 #
 # Read-only — never places orders. Needs these repo secrets:
 # BINANCE_API_KEY, BINANCE_API_SECRET, SMTP_HOST, SMTP_USER, SMTP_PASSWORD,
-# EMAIL_TO. HALAL_TERMINAL_API_KEY is optional — leave it unset and that
-# compliance source is just skipped.
+# PERSONAL_EMAIL_TO (your own address — gets the full report: holdings,
+# balances, concentration, consider-selling, $ amounts), EMAIL_TO (the
+# group address — gets only the generic candidate list, no $ figures).
+# HALAL_TERMINAL_API_KEY is optional — leave it unset and that compliance
+# source is just skipped.
 #
 # weekly-portfolio-review-retry.yml auto re-runs this (up to 2 attempts) if
 # it fails due to an infra issue like the self-hosted runner dropping.
@@ -46,14 +49,17 @@ jobs:
           SMTP_USER: ${{ secrets.SMTP_USER }}
           SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
           EMAIL_TO: ${{ secrets.EMAIL_TO }}
+          PERSONAL_EMAIL_TO: ${{ secrets.PERSONAL_EMAIL_TO }}
           HALAL_TERMINAL_API_KEY: ${{ secrets.HALAL_TERMINAL_API_KEY }}
           CONCENTRATION_WARN_PCT: "30"
           DRY_RUN: ${{ inputs.dry_run && '1' || '' }}
         run: /Users/hk-nabeel/.venvs/halal-dca-bot/bin/python weekly_portfolio_review.py
 
-      - name: Upload digest preview
+      - name: Upload digest previews
         if: ${{ inputs.dry_run }}
         uses: actions/upload-artifact@v4
         with:
           name: digest-preview
-          path: digest_preview.html
+          path: |
+            digest_preview_personal.html
+            digest_preview_group.html

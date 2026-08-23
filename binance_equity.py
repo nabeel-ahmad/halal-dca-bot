@@ -37,6 +37,7 @@ SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
 SMTP_USER = os.environ.get("SMTP_USER", "")
 SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD", "")
 EMAIL_TO = os.environ.get("EMAIL_TO", "")
+PERSONAL_EMAIL_TO = os.environ.get("PERSONAL_EMAIL_TO", "")
 
 BINANCE_BASE_URL = "https://api.binance.com"
 
@@ -128,12 +129,12 @@ def get_account_holdings():
     return holdings
 
 
-def send_email_message(subject, body):
+def send_email_message(subject, body, to=EMAIL_TO):
     msg = MIMEText(body)
     msg["Subject"] = subject
     msg["From"] = SMTP_USER
-    msg["To"] = EMAIL_TO
+    msg["To"] = to
     with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
         server.starttls()
         server.login(SMTP_USER, SMTP_PASSWORD)
-        server.sendmail(SMTP_USER, [EMAIL_TO], msg.as_string())
+        server.sendmail(SMTP_USER, [to], msg.as_string())

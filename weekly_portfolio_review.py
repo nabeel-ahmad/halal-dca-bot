@@ -1,8 +1,15 @@
 """
 Weekly Portfolio Review — READ-ONLY, no orders ever placed.
 
-Runs every Sunday and emails you two things about your actual current
-Binance equity holdings:
+Runs every Sunday and sends two separate emails:
+  - PERSONAL_EMAIL_TO (your own address) gets the full report below,
+    including your actual holdings, balances, and $ amounts.
+  - EMAIL_TO (e.g. a group address) gets only item 4, the generic
+    candidate list, with all $ figures stripped out — nothing tied to
+    your personal account.
+
+The full report covers these things about your actual current Binance
+equity holdings:
 
   1. Sharia compliance re-check, against your trusted sources, all queried
      in parallel:
@@ -57,6 +64,7 @@ import requests
 from binance_equity import (
     BINANCE_API_KEY,
     EMAIL_TO,
+    PERSONAL_EMAIL_TO,
     SMTP_HOST,
     SMTP_PASSWORD,
     SMTP_PORT,
@@ -487,30 +495,32 @@ def compute_recommendations(stablecoin_balance):
     }
 
 
-def render_recommendations_text(rec):
+def render_recommendations_text(rec, include_amounts=True):
     lines = ["\n=== This week's halal candidates (new money) ===\n"]
-    lines.append(
-        f"USDT+USDC balance: ${rec['stablecoin_balance']:.2f} | "
-        f"cash reserve target: ${CASH_RESERVE_TARGET_USD} | "
-        f"investable: ${rec['investable']:.2f}"
-    )
-    if rec["investable"] == 0:
-        lines.append("Nothing above the cash reserve target to deploy this week — candidates listed for reference only.")
-    lines.append("")
+    if include_amounts:
+        lines.append(
+            f"USDT+USDC balance: ${rec['stablecoin_balance']:.2f} | "
+            f"cash reserve target: ${CASH_RESERVE_TARGET_USD} | "
+            f"investable: ${rec['investable']:.2f}"
+        )
+        if rec["investable"] == 0:
+            lines.append("Nothing above the cash reserve target to deploy this week — candidates listed for reference only.")
+        lines.append("")
     for p in rec["picks"]:
         grade_note = p["halal_grade"] if p["halal_grade"] != "UNKNOWN" else f"UNKNOWN (verify: {p['musaffa_url']})"
+        suggested = f" | suggested: ${p['suggested_usd']:.2f}" if include_amounts else ""
         if p["asset_type"] == "stock":
             lines.append(
                 f"[STOCK] {p['ticker']} — {p['name']} | halal rating: {grade_note} | "
                 f"analyst rating: {p['analyst_rating']} | "
-                f"sector: {p['sector']} | mkt cap: {p['market_cap']} | suggested: ${p['suggested_usd']:.2f} | "
+                f"sector: {p['sector']} | mkt cap: {p['market_cap']}{suggested} | "
                 f"buy on Binance: {p['binance_url']}"
             )
         else:
             lines.append(
                 f"[ETF]   {p['ticker']} — {p['name']} | halal rating: {grade_note} | "
                 f"holdings: {p['num_holdings']} | "
-                f"segment: {p['segment']} | suggested: ${p['suggested_usd']:.2f} | "
+                f"segment: {p['segment']}{suggested} | "
                 f"buy on Binance: {p['binance_url']}"
             )
     lines.append(
@@ -527,7 +537,7 @@ def render_recommendations_text(rec):
     return "\n".join(lines)
 
 
-def render_recommendations_html(rec):
+def render_recommendations_html(rec, include_amounts=True):
     def grade_badge(p):
         grade = p["halal_grade"]
         color = "#9a6700" if grade == "UNKNOWN" else "#1a7f37"
@@ -548,30 +558,47 @@ def render_recommendations_html(rec):
             f'<a href="{escape(p["binance_url"])}" style="color:#1f2328;text-decoration:none;">'
             f'{escape(p["ticker"])}</a>'
         )
+        amount_cell = (
+            f'<td style="padding:8px;border-bottom:1px solid #d0d7de;text-align:right;">${p["suggested_usd"]:.2f}</td>'
+            if include_amounts else ""
+        )
         return (
             "<tr>"
             f'<td style="padding:8px;border-bottom:1px solid #d0d7de;font-weight:600;">{ticker_cell}</td>'
             f'<td style="padding:8px;border-bottom:1px solid #d0d7de;">{type_badge}</td>'
             f'<td style="padding:8px;border-bottom:1px solid #d0d7de;">{grade_badge(p)}</td>'
             f'<td style="padding:8px;border-bottom:1px solid #d0d7de;font-size:12px;">{escape(p["name"])}<br>{detail}</td>'
-            f'<td style="padding:8px;border-bottom:1px solid #d0d7de;text-align:right;">${p["suggested_usd"]:.2f}</td>'
+            f"{amount_cell}"
             "</tr>"
         )
 
     note = ""
-    if rec["investable"] == 0:
+    if include_amounts and rec["investable"] == 0:
         note = '<p style="font-size:13px;color:#9a6700;">Nothing above the cash reserve target to deploy this week — candidates listed for reference only.</p>'
 
     favorite_list = ", ".join(escape(p["ticker"]) for p in rec["picks"])
 
-    return f"""\
-<div style="font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;color:#1f2328;background:#ffffff;max-width:680px;padding:16px;">
-  <h3 style="margin-top:0;">This week's halal candidates (new money)</h3>
-  <p style="font-size:13px;color:#57606a;">
+    balance_line = (
+        f"""<p style="font-size:13px;color:#57606a;">
     USDT+USDC balance: <b>${rec['stablecoin_balance']:.2f}</b> &nbsp;|&nbsp;
     cash reserve target: <b>${CASH_RESERVE_TARGET_USD}</b> &nbsp;|&nbsp;
     investable: <b>${rec['investable']:.2f}</b>
-  </p>
+  </p>"""
+        if include_amounts else ""
+    )
+    amount_header = (
+        '<th style="padding:8px;border-bottom:2px solid #d0d7de;text-align:right;">Suggested</th>'
+        if include_amounts else ""
+    )
+    amounts_note = (
+        f" Amounts split equally across the {len(rec['picks'])} picks from whatever's above your cash reserve target."
+        if include_amounts else ""
+    )
+
+    return f"""\
+<div style="font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;color:#1f2328;background:#ffffff;max-width:680px;padding:16px;">
+  <h3 style="margin-top:0;">This week's halal candidates (new money)</h3>
+  {balance_line}
   {note}
   <table style="width:100%;border-collapse:collapse;font-size:14px;">
     <thead>
@@ -579,7 +606,7 @@ def render_recommendations_html(rec):
         <th style="padding:8px;border-bottom:2px solid #d0d7de;">Ticker</th>
         <th style="padding:8px;border-bottom:2px solid #d0d7de;">Type</th>
         <th style="padding:8px;border-bottom:2px solid #d0d7de;">Details</th>
-        <th style="padding:8px;border-bottom:2px solid #d0d7de;text-align:right;">Suggested</th>
+        {amount_header}
       </tr>
     </thead>
     <tbody>
@@ -590,8 +617,7 @@ def render_recommendations_html(rec):
     Filter applied (Musaffa screener): Sharia-compliant, Musaffa rating A/A+, analyst consensus
     Buy/Strong Buy (stocks) &mdash; sorted by number of holdings (ETFs). Also excludes anything
     on the BDS priority-boycott list or a major US DoD prime contractor, and anything Halal
-    Terminal flags NON_COMPLIANT{'' if HALAL_TERMINAL_API_KEY else ' (skipped &mdash; HALAL_TERMINAL_API_KEY not set)'}.
-    Amounts split equally across the {len(rec["picks"])} picks from whatever's above your cash reserve target.
+    Terminal flags NON_COMPLIANT{'' if HALAL_TERMINAL_API_KEY else ' (skipped &mdash; HALAL_TERMINAL_API_KEY not set)'}.{amounts_note}
   </p>
   <p style="font-size:12px;color:#9a6700;">
     Binance has no API for marking favorites &mdash; favorite these manually in the app: {favorite_list}
@@ -600,21 +626,21 @@ def render_recommendations_html(rec):
 """
 
 
-def send_report_email(subject, text_body, html_body):
+def send_report_email(subject, text_body, html_body, to):
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
     msg["From"] = SMTP_USER
-    msg["To"] = EMAIL_TO
+    msg["To"] = to
     msg.attach(MIMEText(text_body, "plain"))
     msg.attach(MIMEText(html_body, "html"))
     with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
         server.starttls()
         server.login(SMTP_USER, SMTP_PASSWORD)
-        server.sendmail(SMTP_USER, [EMAIL_TO], msg.as_string())
+        server.sendmail(SMTP_USER, [to], msg.as_string())
 
 
 def main():
-    required = [BINANCE_API_KEY, SMTP_HOST, SMTP_USER, SMTP_PASSWORD, EMAIL_TO]
+    required = [BINANCE_API_KEY, SMTP_HOST, SMTP_USER, SMTP_PASSWORD, EMAIL_TO, PERSONAL_EMAIL_TO]
     if not all(required):
         print("Missing required environment variables/secrets. Aborting.", file=sys.stderr)
         sys.exit(1)
@@ -625,33 +651,45 @@ def main():
     if not holdings:
         message = "No equity holdings found on Binance right now — nothing to review this week."
         if dry_run:
-            print(f"DRY_RUN=1 — would have sent: {message}")
+            print(f"DRY_RUN=1 — would have sent to {PERSONAL_EMAIL_TO}: {message}")
         else:
-            send_email_message("Weekly portfolio review — nothing held", message)
+            send_email_message("Weekly portfolio review — nothing held", message, to=PERSONAL_EMAIL_TO)
         return
 
     prices = get_current_prices(list(holdings))
 
     rows, total_value = compute_rows(holdings, prices)
-    text_body = render_text(rows, total_value)
-    html_body = render_html(rows, total_value)
+    personal_text = render_text(rows, total_value)
+    personal_html = render_html(rows, total_value)
 
+    group_text = ""
+    group_html = ""
     try:
         rec = compute_recommendations(get_stablecoin_balance())
-        text_body += render_recommendations_text(rec)
-        html_body += render_recommendations_html(rec)
+        personal_text += render_recommendations_text(rec)
+        personal_html += render_recommendations_html(rec)
+        group_text = render_recommendations_text(rec, include_amounts=False)
+        group_html = render_recommendations_html(rec, include_amounts=False)
     except Exception as e:
         print(f"Note: couldn't build this week's candidate recommendations: {e}", file=sys.stderr)
-        text_body += f"\n\n(Couldn't pull this week's halal candidates: {e})"
-        html_body += f'<p style="color:#9a6700;">(Couldn\'t pull this week\'s halal candidates: {escape(str(e))})</p>'
+        note_text = f"\n\n(Couldn't pull this week's halal candidates: {e})"
+        note_html = f'<p style="color:#9a6700;">(Couldn\'t pull this week\'s halal candidates: {escape(str(e))})</p>'
+        personal_text += note_text
+        personal_html += note_html
+        group_text += note_text
+        group_html += note_html
 
     if dry_run:
-        with open("digest_preview.html", "w") as f:
-            f.write(html_body)
-        print("DRY_RUN=1 — wrote digest_preview.html instead of sending email.")
+        with open("digest_preview_personal.html", "w") as f:
+            f.write(personal_html)
+        with open("digest_preview_group.html", "w") as f:
+            f.write(group_html)
+        print("DRY_RUN=1 — wrote digest_preview_personal.html and digest_preview_group.html instead of sending email.")
         return
 
-    send_report_email("Weekly portfolio review", text_body, html_body)
+    send_report_email("Weekly portfolio review", personal_text, personal_html, to=PERSONAL_EMAIL_TO)
+    if group_html:
+        send_report_email("This week's halal candidates", group_text, group_html, to=EMAIL_TO)
 
 
 if __name__ == "__main__":
