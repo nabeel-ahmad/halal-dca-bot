@@ -1,4 +1,3 @@
-\
 # Throwaway diagnostic — checks what /sapi/v1/equity/market/quote actually
 # returns for a given ticker. Delete after use.
 
