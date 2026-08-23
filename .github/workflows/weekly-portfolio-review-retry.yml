@@ -1,0 +1,27 @@
+# Auto-retries "Weekly Portfolio Review" when it fails due to infra issues
+# (e.g. "self-hosted runner lost communication with the server") rather than
+# a real code/data error. Retrying inside the job itself doesn't help those
+# failures since the whole runner process dies mid-job — this instead
+# re-runs the failed job via the GitHub API from a GitHub-hosted runner.
+#
+# Caps at 2 retries (run_attempt <= 2) to avoid looping forever on a
+# genuinely broken run.
+
+name: Retry Weekly Portfolio Review
+
+on:
+  workflow_run:
+    workflows: ["Weekly Portfolio Review"]
+    types: [completed]
+
+jobs:
+  retry:
+    if: github.event.workflow_run.conclusion == 'failure' && github.event.workflow_run.run_attempt <= 2
+    runs-on: ubuntu-latest
+    steps:
+      - name: Re-run failed jobs
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api "repos/${{ github.repository }}/actions/runs/${{ github.event.workflow_run.id }}/rerun-failed-jobs" \
+            --method POST

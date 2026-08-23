@@ -13,6 +13,9 @@
 # BINANCE_API_KEY, BINANCE_API_SECRET, SMTP_HOST, SMTP_USER, SMTP_PASSWORD,
 # EMAIL_TO. HALAL_TERMINAL_API_KEY is optional — leave it unset and that
 # compliance source is just skipped.
+#
+# weekly-portfolio-review-retry.yml auto re-runs this (up to 2 attempts) if
+# it fails due to an infra issue like the self-hosted runner dropping.
 
 name: Weekly Portfolio Review
 
