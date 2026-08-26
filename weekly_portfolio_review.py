@@ -32,19 +32,26 @@ equity holdings:
      This reports numbers, not what to buy or sell.
 
   3. A "Consider selling" list: any held ticker that's gone NON_COMPLIANT,
-     picked up an ethics flag, or had its Musaffa halal letter grade drop
-     below A (A- or lower) since it was bought. This is informational only
-     — no order is ever placed — and is not based on analyst rating, since
-     Musaffa doesn't expose a per-ticker analyst-consensus rating outside
-     its screener (only for the small set of tickers the screener itself
+     picked up an ethics flag, had its Musaffa halal letter grade drop below
+     A (A- or lower), or whose grade simply couldn't be verified this run
+     (a scrape failure is a "check this manually" signal, not silence — a
+     downgrade flagged one week must not just vanish the next because the
+     scrape happened to fail). This is informational only — no order is
+     ever placed — and is not based on analyst rating, since Musaffa
+     doesn't expose a per-ticker analyst-consensus rating outside its
+     screener (only for the small set of tickers the screener itself
      returns, not arbitrary held tickers).
 
   4. Candidate stocks/ETFs matching a Musaffa screener filter you specified
      (Sharia-compliant, rating A/A+, analyst Buy/Strong Buy), excluding
      anything on the BDS priority-boycott list or a major US DoD prime
-     contractor and anything Halal Terminal flags NON_COMPLIANT (if
-     HALAL_TERMINAL_API_KEY is set), with a mechanical $ split of idle cash
-     above your reserve target.
+     contractor. Every candidate is then re-checked with the same
+     dual-source compliance check (Musaffa + Halal Terminal) held positions
+     get, routed to each source's ETF-specific endpoint for ETFs — a
+     candidate either source can't confirm COMPLIANT (including an ETF
+     neither can fully evaluate) is dropped, not shown with an unverified
+     screener grade. A mechanical $ split of idle cash above your reserve
+     target follows.
 
 SECURITY: never hardcode credentials. Env vars pulled from binance_equity.py.
 """
@@ -104,9 +111,11 @@ def _strip_tags(html):
     return unescape(re.sub(r"<[^>]+>", " ", html))
 
 
-def check_musaffa(ticker):
-    """musaffa.com/stock/<TICKER> — FAQ text: '<TICKER> is classified as <status>'."""
-    url = f"https://musaffa.com/stock/{ticker}"
+def check_musaffa(ticker, asset_type="stock"):
+    """musaffa.com/(stock|etf)/<TICKER> — FAQ text: '<TICKER> is classified as <status>'.
+    Must use the /etf/ path for ETFs — the /stock/ page 404s for them."""
+    path = "etf" if asset_type == "etf" else "stock"
+    url = f"https://musaffa.com/{path}/{ticker}"
     try:
         resp = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=HTTP_TIMEOUT)
         resp.raise_for_status()
@@ -128,13 +137,23 @@ def check_musaffa(ticker):
     return UNKNOWN, url, f"unrecognized status text: {status!r}"
 
 
-def check_halal_terminal(ticker):
-    """api.halalterminal.com/api/screen/<TICKER> — real JSON API (not a
-    scrape), screening against AAOIFI/DJIM/FTSE/MSCI/S&P simultaneously.
-    Only called when HALAL_TERMINAL_API_KEY is set — sign up yourself at
-    halalterminal.com for a free-tier key; this project never creates
-    accounts or holds credentials on your behalf."""
-    url = f"https://api.halalterminal.com/api/screen/{ticker}"
+def check_halal_terminal(ticker, asset_type="stock"):
+    """api.halalterminal.com — real JSON API (not a scrape), screening
+    against AAOIFI/DJIM/FTSE/MSCI/S&P simultaneously. Only called when
+    HALAL_TERMINAL_API_KEY is set — sign up yourself at halalterminal.com
+    for a free-tier key; this project never creates accounts or holds
+    credentials on your behalf.
+
+    ETFs need a different endpoint — the stock endpoint's own error message
+    says so explicitly ("stock-screen endpoint cannot evaluate compliance.
+    Use /api/etf/{symbol}/screen for holdings-based compliance"), and the
+    two previously being conflated is why ETF candidates showed a
+    confident-looking grade despite neither compliance source having
+    actually evaluated them."""
+    if asset_type == "etf":
+        url = f"https://api.halalterminal.com/api/etf/{ticker}/screen"
+    else:
+        url = f"https://api.halalterminal.com/api/screen/{ticker}"
     if not HALAL_TERMINAL_API_KEY:
         return UNKNOWN, url, "HALAL_TERMINAL_API_KEY not set — skipped"
     try:
@@ -168,12 +187,12 @@ def check_halal_terminal(ticker):
     return UNKNOWN, url, data.get("error_message") or status or "insufficient data"
 
 
-def check_compliance(ticker):
+def check_compliance(ticker, asset_type="stock"):
     checks = {"musaffa": check_musaffa}
     if HALAL_TERMINAL_API_KEY:
         checks["halal_terminal"] = check_halal_terminal
     with ThreadPoolExecutor(max_workers=len(checks)) as pool:
-        futures = {name: pool.submit(fn, ticker) for name, fn in checks.items()}
+        futures = {name: pool.submit(fn, ticker, asset_type) for name, fn in checks.items()}
         results = {name: future.result() for name, future in futures.items()}
 
     statuses = {v[0] for v in results.values()}
@@ -186,16 +205,20 @@ def check_compliance(ticker):
     return overall, results
 
 
-def get_halal_terminal_non_compliant(tickers):
-    """Tickers Halal Terminal explicitly flags NON_COMPLIANT — used to screen
-    out new-money candidates, not just held positions. Returns empty if no
-    API key is set (no source to check, so nothing gets excluded on that basis)."""
-    if not HALAL_TERMINAL_API_KEY:
-        return set()
-    tickers = list(tickers)
-    with ThreadPoolExecutor(max_workers=min(TICKER_FETCH_WORKERS, len(tickers) or 1)) as pool:
-        results = pool.map(lambda t: (t, check_halal_terminal(t)[0]), tickers)
-    return {t for t, status in results if status == NON_COMPLIANT}
+def get_verified_compliant_tickers(candidates):
+    """Runs the full dual-source check_compliance() (same one used for held
+    positions) against each new-money candidate, keyed to its own asset_type
+    so ETFs hit the ETF endpoint instead of the stock one. Only tickers both
+    sources actually confirm COMPLIANT pass — an UNKNOWN (declined/failed
+    to evaluate, e.g. an ETF with no working screen) is excluded same as a
+    NON_COMPLIANT, not defaulted through. The screener's own scraped letter
+    grade is not a substitute for this — it's a different, unverified
+    pipeline (see check_musaffa/check_halal_terminal vs.
+    musaffa_recommendations.enrich_with_halal_grade)."""
+    candidates = list(candidates)
+    with ThreadPoolExecutor(max_workers=min(TICKER_FETCH_WORKERS, len(candidates) or 1)) as pool:
+        results = pool.map(lambda c: (c["ticker"], check_compliance(c["ticker"], c["asset_type"])[0]), candidates)
+    return {ticker for ticker, overall in results if overall == COMPLIANT}
 
 
 SYMBOL = {COMPLIANT: "✅", NON_COMPLIANT: "❌", UNKNOWN: "⚠️"}
@@ -239,6 +262,8 @@ def compute_rows(holdings, prices):
             sell_reasons.append("/".join(f["type"] for f in ethics_flags) + " ethics flag")
         if grade_below_a(halal_grade):
             sell_reasons.append(f"halal rating downgraded to {halal_grade}")
+        elif halal_grade == "UNKNOWN":
+            sell_reasons.append("halal rating could not be verified this run — check manually")
         return {
             "ticker": ticker,
             "compliance": overall,
@@ -467,15 +492,19 @@ def compute_recommendations(stablecoin_balance):
     # Overfetch since some Musaffa candidates won't be tradable on Binance
     # Stocks Trading, or get flagged by Halal Terminal; filtering those out
     # shouldn't shrink the final count.
-    stocks = get_stock_candidates(NUM_STOCK_PICKS * 4, exclude_tickers=EXCLUDED_TICKERS)
-    etfs = get_etf_candidates(NUM_ETF_PICKS * 4, exclude_tickers=EXCLUDED_TICKERS)
-    all_tickers = {c["ticker"] for c in stocks + etfs}
-    tradable = get_tradable_tickers(all_tickers)
-    non_compliant = get_halal_terminal_non_compliant(all_tickers)
-    keep = tradable - non_compliant
+    stocks = [dict(c, asset_type="stock") for c in get_stock_candidates(NUM_STOCK_PICKS * 4, exclude_tickers=EXCLUDED_TICKERS)]
+    etfs = [dict(c, asset_type="etf") for c in get_etf_candidates(NUM_ETF_PICKS * 4, exclude_tickers=EXCLUDED_TICKERS)]
+    candidates = stocks + etfs
+    tradable = get_tradable_tickers({c["ticker"] for c in candidates})
+    # Full dual-source compliance check per candidate, same as held positions
+    # get — not just a Halal Terminal non-compliant filter. A candidate whose
+    # sources can't actually evaluate it (e.g. an ETF the screen endpoint
+    # declines) is excluded, not shown with an unverified "A" grade.
+    verified_compliant = get_verified_compliant_tickers([c for c in candidates if c["ticker"] in tradable])
+    keep = tradable & verified_compliant
     stocks = [c for c in stocks if c["ticker"] in keep][:NUM_STOCK_PICKS]
     etfs = [c for c in etfs if c["ticker"] in keep][:NUM_ETF_PICKS]
-    picks = [dict(p, asset_type="stock") for p in stocks] + [dict(p, asset_type="etf") for p in etfs]
+    picks = stocks + etfs
     enrich_with_halal_grade(picks)
     for p in picks:
         path = "etf" if p["asset_type"] == "etf" else "stock"
@@ -527,8 +556,10 @@ def render_recommendations_text(rec, include_amounts=True):
         "\nFilter applied (Musaffa screener): Sharia-compliant, Musaffa rating A/A+, "
         "analyst consensus Buy/Strong Buy (stocks) — sorted by number of holdings (ETFs). "
         "Also excludes anything on the BDS priority-boycott list or a major US DoD prime "
-        "contractor (see ethics_screens.py), and anything Halal Terminal flags "
-        "NON_COMPLIANT" + ("" if HALAL_TERMINAL_API_KEY else " (skipped — HALAL_TERMINAL_API_KEY not set)") + "."
+        "contractor (see ethics_screens.py). Every pick below additionally passed a full "
+        "dual-source compliance re-check (Musaffa + Halal Terminal, same check held positions "
+        "get) — anything that check couldn't confirm COMPLIANT, including ETFs neither source "
+        "can fully evaluate, is excluded rather than shown unverified."
     )
     lines.append(
         "Binance has no API for marking favorites — favorite these manually in the app: "
@@ -616,8 +647,10 @@ def render_recommendations_html(rec, include_amounts=True):
   <p style="font-size:12px;color:#57606a;">
     Filter applied (Musaffa screener): Sharia-compliant, Musaffa rating A/A+, analyst consensus
     Buy/Strong Buy (stocks) &mdash; sorted by number of holdings (ETFs). Also excludes anything
-    on the BDS priority-boycott list or a major US DoD prime contractor, and anything Halal
-    Terminal flags NON_COMPLIANT{'' if HALAL_TERMINAL_API_KEY else ' (skipped &mdash; HALAL_TERMINAL_API_KEY not set)'}.{amounts_note}
+    on the BDS priority-boycott list or a major US DoD prime contractor. Every pick below
+    additionally passed a full dual-source compliance re-check (Musaffa + Halal Terminal, same
+    check held positions get) &mdash; anything that check couldn't confirm COMPLIANT, including
+    ETFs neither source can fully evaluate, is excluded rather than shown unverified.{amounts_note}
   </p>
   <p style="font-size:12px;color:#9a6700;">
     Binance has no API for marking favorites &mdash; favorite these manually in the app: {favorite_list}
