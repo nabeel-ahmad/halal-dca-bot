@@ -1,0 +1,33 @@
+# Throwaway diagnostic — checks why candidate compliance checks are all
+# coming back UNKNOWN. Delete after use.
+
+name: Debug Compliance
+
+on:
+  workflow_dispatch:
+    inputs:
+      tickers:
+        description: "comma-separated tickers"
+        required: true
+
+jobs:
+  debug:
+    runs-on: [self-hosted, macOS, ARM64]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check compliance sources per ticker
+        env:
+          HALAL_TERMINAL_API_KEY: ${{ secrets.HALAL_TERMINAL_API_KEY }}
+          TICKERS: ${{ inputs.tickers }}
+        run: |
+          /Users/hk-nabeel/.venvs/halal-dca-bot/bin/python3 -c "
+          import os
+          from weekly_portfolio_review import check_musaffa, check_halal_terminal, check_compliance
+          tickers = os.environ['TICKERS'].split(',')
+          for t in tickers:
+              print('---', t, '---')
+              print('musaffa:', check_musaffa(t))
+              print('halal_terminal:', check_halal_terminal(t))
+              print('overall:', check_compliance(t))
+          "
