@@ -18,7 +18,7 @@ suggests aren't a recommendation to actually buy them.
 
 | File | Purpose |
 |---|---|
-| `weekly_portfolio_review.py` | Entry point. Re-checks current holdings' Sharia compliance (Musaffa + optional Halal Terminal, checked in parallel) and halal letter grade, flags concentration risk and additional ethics screens, surfaces a "Consider selling" list, and emails a shortlist of A/A+-rated candidate stocks & ETFs matching a Musaffa screener filter, with a mechanical $ split of idle cash. |
+| `weekly_portfolio_review.py` | Entry point. Re-checks current holdings' Sharia compliance (Musaffa + optional Halal Terminal, checked in parallel) and halal letter grade, flags concentration risk and additional ethics screens, surfaces a "Consider selling" list, and emails a shortlist of A/A+-rated candidate stocks & ETFs matching a Musaffa screener filter, with a mechanical $ split of idle cash. Despite the repo name, this isn't staged/dollar-cost-averaged across weeks — it deploys everything above `CASH_RESERVE_TARGET_USD` in one pass each run, and the candidate set can turn over entirely week to week with no position continuity. |
 | `binance_equity.py` | Binance Stocks Trading API client (signed requests, holdings, prices) + SMTP sender, shared by the review script. |
 | `musaffa_recommendations.py` | Headless-browser (Playwright) scraper for the Musaffa screener and per-ticker Halal Rating grade — the screener table is JS-rendered, so a plain HTTP request won't see it. |
 | `ethics_screens.py` | Small, manually-curated reference lists used to warn on existing holdings and exclude from new candidates — see inline comments in the file for sourcing. |

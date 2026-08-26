@@ -25,7 +25,12 @@ equity holdings:
      only linked for manual cross-check, not scraped.
      Any fetch failure, unrecognized page structure, or disagreement
      between sources is reported as UNKNOWN, not silently skipped — this
-     is exactly the case you'd want a human to look at.
+     is exactly the case you'd want a human to look at. When Halal
+     Terminal's response carries an impure-income percentage, it's surfaced
+     per holding too (for dividend purification) — but that field name
+     hasn't been confirmed against a live response yet (see
+     check_halal_terminal's docstring), so treat it as a starting point to
+     verify, not a final number.
 
   2. Mechanical concentration numbers: weight of each position, and a
      flag if any position exceeds CONCENTRATION_WARN_PCT of the portfolio.
@@ -55,7 +60,10 @@ equity holdings:
      the same ticker — a mismatch (a renamed or repurposed company whose
      screener entry hasn't caught up) is dropped too, since the grade may
      have been computed against the wrong business. A mechanical $ split of
-     idle cash above your reserve target follows.
+     idle cash above your reserve target follows — despite the repo's name,
+     this is a lump-sum split each run, not staged/dollar-cost-averaged
+     across weeks, and the candidate set can turn over entirely week to
+     week with no position continuity.
 
 SECURITY: never hardcode credentials. Env vars pulled from binance_equity.py.
 """
@@ -101,6 +109,12 @@ CONCENTRATION_WARN_PCT = Decimal(os.environ.get("CONCENTRATION_WARN_PCT", "30"))
 CASH_RESERVE_TARGET_USD = Decimal(os.environ.get("CASH_RESERVE_TARGET_USD", "500"))
 NUM_STOCK_PICKS = int(os.environ.get("NUM_STOCK_PICKS", "7"))
 NUM_ETF_PICKS = int(os.environ.get("NUM_ETF_PICKS", "3"))
+# Musaffa exposes no analyst-coverage count anywhere (checked: not in the
+# screener table, not on the per-ticker detail page) — an OWLS at $479M with
+# one analyst's opinion renders identically to a WST at $23.9B with a real
+# consensus. Market cap is a rough, honest proxy for that (thin coverage
+# clusters in micro/small caps), not a substitute for the real number.
+MIN_MARKET_CAP_USD = Decimal(os.environ.get("MIN_MARKET_CAP_USD", "2000000000"))
 HALAL_TERMINAL_API_KEY = os.environ.get("HALAL_TERMINAL_API_KEY", "")
 HTTP_TIMEOUT = 10
 USER_AGENT = (
@@ -118,30 +132,30 @@ def _strip_tags(html):
 def check_musaffa(ticker, asset_type="stock"):
     """musaffa.com/(stock|etf)/<TICKER> — FAQ text: '<TICKER> is classified as <status>'.
     Must use the /etf/ path for ETFs — the /stock/ page 404s for them.
-    Returns (status, url, detail, name) — name is always None here; this
-    scrape doesn't parse the page's own company-name text, unlike Halal
-    Terminal's JSON which hands it back directly."""
+    Returns (status, url, detail, metadata) — metadata is always {} here;
+    this scrape doesn't parse the page's own company-name or impure-income
+    data, unlike Halal Terminal's JSON which hands both back directly."""
     path = "etf" if asset_type == "etf" else "stock"
     url = f"https://musaffa.com/{path}/{ticker}"
     try:
         resp = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=HTTP_TIMEOUT)
         resp.raise_for_status()
     except requests.RequestException as e:
-        return UNKNOWN, url, f"fetch failed: {e}", None
+        return UNKNOWN, url, f"fetch failed: {e}", {}
 
     if ticker.upper() not in resp.text.upper():
-        return UNKNOWN, url, "ticker not found on page", None
+        return UNKNOWN, url, "ticker not found on page", {}
 
     text = _strip_tags(resp.text)
     m = re.search(r"classified as\s+([a-z\- ]+?)(?:\.|,| according| by)", text, re.I)
     if not m:
-        return UNKNOWN, url, "compliance phrase not found", None
+        return UNKNOWN, url, "compliance phrase not found", {}
     status = m.group(1).strip().lower()
     if status == "halal":
-        return COMPLIANT, url, status, None
+        return COMPLIANT, url, status, {}
     if status in ("not halal", "haram", "doubtful", "non-compliant"):
-        return NON_COMPLIANT, url, status, None
-    return UNKNOWN, url, f"unrecognized status text: {status!r}", None
+        return NON_COMPLIANT, url, status, {}
+    return UNKNOWN, url, f"unrecognized status text: {status!r}", {}
 
 
 def check_halal_terminal(ticker, asset_type="stock"):
@@ -158,48 +172,75 @@ def check_halal_terminal(ticker, asset_type="stock"):
     confident-looking grade despite neither compliance source having
     actually evaluated them.
 
-    Returns (status, url, detail, name) — name is the company name the API
-    itself reports for the ticker (None if unavailable), used to cross-check
-    against Musaffa's independently-scraped name and catch a stale
-    ticker-to-company mapping on either side (e.g. a renamed/re-purposed
-    company still carrying a grade computed against its old business)."""
+    Returns (status, url, detail, metadata). metadata is a dict, {} if
+    unavailable, that may carry:
+      - "name": the company name the API itself reports for the ticker,
+        used to cross-check against Musaffa's independently-scraped name
+        and catch a stale ticker-to-company mapping on either side (e.g. a
+        renamed/re-purposed company still carrying a grade computed
+        against its old business).
+      - "impure_income_pct": the share of income from non-compliant
+        activity, if the API exposes it under any of a few plausible field
+        names — used for dividend purification (the % of dividends from a
+        passing-but-not-fully-clean company that should be given away).
+        This project has not been able to confirm the real field name
+        against a live response (free-tier quota exhausted while writing
+        this) — treat a None here as "not confirmed yet", not "zero
+        impure income", and verify manually via the URL below until
+        confirmed against a real response."""
     if asset_type == "etf":
         url = f"https://api.halalterminal.com/api/etf/{ticker}/screen"
     else:
         url = f"https://api.halalterminal.com/api/screen/{ticker}"
     if not HALAL_TERMINAL_API_KEY:
-        return UNKNOWN, url, "HALAL_TERMINAL_API_KEY not set — skipped", None
+        return UNKNOWN, url, "HALAL_TERMINAL_API_KEY not set — skipped", {}
+    if os.environ.get("DRY_RUN") == "1":
+        # The free tier is a hard 500-token monthly cap, not a per-day
+        # allowance — a handful of manual dry runs during development can
+        # exhaust it for the rest of the period. Dry runs are for checking
+        # rendering/logic, not for validating live compliance data, so skip
+        # the call entirely rather than spend quota on it.
+        return UNKNOWN, url, "DRY_RUN=1 — Halal Terminal call skipped to conserve quota", {}
     try:
         resp = requests.post(url, headers={"X-API-Key": HALAL_TERMINAL_API_KEY}, timeout=HTTP_TIMEOUT)
     except requests.RequestException as e:
-        return UNKNOWN, url, f"fetch failed: {e}", None
+        return UNKNOWN, url, f"fetch failed: {e}", {}
 
     if resp.status_code == 401:
-        return UNKNOWN, url, "API key missing or invalid", None
+        return UNKNOWN, url, "API key missing or invalid", {}
     if resp.status_code == 429:
-        return UNKNOWN, url, "quota exceeded", None
+        return UNKNOWN, url, "quota exceeded", {}
     try:
         resp.raise_for_status()
         data = resp.json()
     except (requests.RequestException, ValueError) as e:
-        return UNKNOWN, url, f"fetch failed: {e}", None
+        return UNKNOWN, url, f"fetch failed: {e}", {}
 
-    name = data.get("name")
+    metadata = {
+        "name": data.get("name"),
+        # Field name unconfirmed against a live response — see docstring.
+        "impure_income_pct": (
+            data.get("impure_income_pct")
+            or data.get("non_compliant_income_percentage")
+            or data.get("purification_percentage")
+            or data.get("haram_income_pct")
+        ),
+    }
 
     # shariah_compliance_status is null on some cached rows (per the API's own
     # schema notes) — is_compliant is the boolean field that's actually
     # populated then, so fall back to it before giving up as UNKNOWN.
     status = data.get("shariah_compliance_status")
     if status == "compliant":
-        return COMPLIANT, url, status, name
+        return COMPLIANT, url, status, metadata
     if status == "non_compliant":
-        return NON_COMPLIANT, url, status, name
+        return NON_COMPLIANT, url, status, metadata
     is_compliant = data.get("is_compliant")
     if is_compliant is True:
-        return COMPLIANT, url, "is_compliant=true", name
+        return COMPLIANT, url, "is_compliant=true", metadata
     if is_compliant is False:
-        return NON_COMPLIANT, url, "is_compliant=false", name
-    return UNKNOWN, url, data.get("error_message") or status or "insufficient data", name
+        return NON_COMPLIANT, url, "is_compliant=false", metadata
+    return UNKNOWN, url, data.get("error_message") or status or "insufficient data", metadata
 
 
 def check_compliance(ticker, asset_type="stock"):
@@ -269,7 +310,7 @@ def get_verified_compliant_tickers(candidates):
         ticker = candidate["ticker"]
         if overall != COMPLIANT:
             continue
-        halal_terminal_name = sources.get("halal_terminal", (None, None, None, None))[3]
+        halal_terminal_name = sources.get("halal_terminal", (None, None, None, {}))[3].get("name")
         if halal_terminal_name and not _names_plausibly_match(candidate.get("name"), halal_terminal_name):
             print(
                 f"Note: {ticker} excluded from candidates — name mismatch between Musaffa "
@@ -325,10 +366,12 @@ def compute_rows(holdings, prices):
             sell_reasons.append(f"halal rating downgraded to {halal_grade}")
         elif halal_grade == "UNKNOWN":
             sell_reasons.append("halal rating could not be verified this run — check manually")
+        impure_income_pct = sources.get("halal_terminal", (None, None, None, {}))[3].get("impure_income_pct")
         return {
             "ticker": ticker,
             "compliance": overall,
             "sources": sources,
+            "impure_income_pct": impure_income_pct,
             "value": value,
             "pct": pct if len(holdings) > 1 else Decimal("100"),
             "over_concentrated": over_concentrated,
@@ -390,8 +433,13 @@ def render_text(rows, total_value):
         if r["halal_grade"] != "UNKNOWN" and not r["halal_grade_verified"]:
             grade_note += " (screener-scraped, unverified — compliance sources returned UNKNOWN)"
         lines.append(f"{r['ticker']}: {r['compliance']} | halal rating: {grade_note}")
-        for source_name, (status, url, detail, _company_name) in r["sources"].items():
+        for source_name, (status, url, detail, _metadata) in r["sources"].items():
             lines.append(f"    {source_name}: {status} ({detail}) — {url}")
+        if r["impure_income_pct"] is not None:
+            lines.append(
+                f"    impure income: {r['impure_income_pct']}% — purify this share of dividends "
+                "(field name unconfirmed against a live API response, verify manually)"
+            )
         lines.append("    manual cross-check: " + " | ".join(MANUAL_LINKS))
         for f in r["ethics_flags"]:
             lines.append(f"    ⚠ {f['type']}: {f['detail']} — {f['source']}")
@@ -457,8 +505,13 @@ def render_html(rows, total_value):
     def compliance_row(r):
         sources_html = "<br>".join(
             f'<a href="{url}" style="color:#57606a;text-decoration:none;">{escape(source_name)}: {SYMBOL[status]} {escape(detail)}</a>'
-            for source_name, (status, url, detail, _company_name) in r["sources"].items()
+            for source_name, (status, url, detail, _metadata) in r["sources"].items()
         )
+        if r["impure_income_pct"] is not None:
+            sources_html += (
+                f'<br><span style="color:#9a6700;">impure income: {escape(str(r["impure_income_pct"]))}% '
+                "&mdash; purify this share of dividends (field name unconfirmed, verify manually)</span>"
+            )
         ethics_html = ""
         if r["ethics_flags"]:
             ethics_html = "<br>" + "<br>".join(
@@ -558,6 +611,17 @@ def get_stablecoin_balance():
     return total
 
 
+def _parse_market_cap(text):
+    """Parses Musaffa's screener market-cap string ("$479.65M", "$23.90B")
+    into a raw dollar figure. Returns None if unparseable — treated as "no
+    cap data" rather than as passing or failing the floor."""
+    m = re.match(r"\$?([\d.]+)\s*([kmbt]?)", (text or "").strip(), re.I)
+    if not m or not m.group(1):
+        return None
+    multiplier = {"": 1, "k": 1e3, "m": 1e6, "b": 1e9, "t": 1e12}[m.group(2).lower()]
+    return Decimal(m.group(1)) * Decimal(multiplier)
+
+
 def compute_recommendations(stablecoin_balance):
     """Mechanical allocation: pull candidates matching the exact Musaffa filter
     you specified (Sharia-compliant, rating A/A+, analyst Buy/Strong Buy for
@@ -570,6 +634,10 @@ def compute_recommendations(stablecoin_balance):
     # shouldn't shrink the final count.
     stocks = [dict(c, asset_type="stock") for c in get_stock_candidates(NUM_STOCK_PICKS * 4, exclude_tickers=EXCLUDED_TICKERS)]
     etfs = [dict(c, asset_type="etf") for c in get_etf_candidates(NUM_ETF_PICKS * 4, exclude_tickers=EXCLUDED_TICKERS)]
+    # Market-cap floor as a coverage-depth proxy for stocks (see
+    # MIN_MARKET_CAP_USD) — applied first since it's free (no network call)
+    # and shrinks what the paid/rate-limited checks below have to do.
+    stocks = [c for c in stocks if (cap := _parse_market_cap(c.get("market_cap"))) is None or cap >= MIN_MARKET_CAP_USD]
     candidates = stocks + etfs
     tradable = get_tradable_tickers({c["ticker"] for c in candidates})
     # Full dual-source compliance check per candidate, same as held positions
@@ -610,6 +678,10 @@ def render_recommendations_text(rec, include_amounts=True):
         )
         if rec["investable"] == 0:
             lines.append("Nothing above the cash reserve target to deploy this week — candidates listed for reference only.")
+        lines.append(
+            "Note: this is a lump-sum split this run, not staged/dollar-cost-averaged across weeks "
+            "— the candidate set can turn over entirely week to week with no position continuity."
+        )
         lines.append("")
     for p in rec["picks"]:
         grade_note = p["halal_grade"] if p["halal_grade"] != "UNKNOWN" else f"UNKNOWN (verify: {p['musaffa_url']})"
@@ -630,9 +702,11 @@ def render_recommendations_text(rec, include_amounts=True):
             )
     lines.append(
         "\nFilter applied (Musaffa screener): Sharia-compliant, Musaffa rating A/A+, "
-        "analyst consensus Buy/Strong Buy (stocks) — sorted by number of holdings (ETFs). "
-        "Also excludes anything on the BDS priority-boycott list or a major US DoD prime "
-        "contractor (see ethics_screens.py). Every pick below additionally passed a full "
+        f"analyst consensus Buy/Strong Buy (stocks, min ${MIN_MARKET_CAP_USD:,.0f} market cap — "
+        "Musaffa doesn't expose analyst-coverage count, so this is a rough proxy against a single "
+        "thinly-covered analyst's opinion reading the same as a real consensus) — sorted by number "
+        "of holdings (ETFs). Also excludes anything on the BDS priority-boycott list or a major US "
+        "DoD prime contractor (see ethics_screens.py). Every pick below additionally passed a full "
         "dual-source compliance re-check (Musaffa + Halal Terminal, same check held positions "
         "get) — anything that check couldn't confirm COMPLIANT, including ETFs neither source "
         "can fully evaluate, is excluded rather than shown unverified."
@@ -698,7 +772,9 @@ def render_recommendations_html(rec, include_amounts=True):
         if include_amounts else ""
     )
     amounts_note = (
-        f" Amounts split equally across the {len(rec['picks'])} picks from whatever's above your cash reserve target."
+        f" Amounts split equally across the {len(rec['picks'])} picks from whatever's above your cash "
+        "reserve target &mdash; this is a lump-sum split this run, not staged across weeks, and the "
+        "candidate set can turn over entirely week to week with no position continuity."
         if include_amounts else ""
     )
 
@@ -722,11 +798,14 @@ def render_recommendations_html(rec, include_amounts=True):
   </table>
   <p style="font-size:12px;color:#57606a;">
     Filter applied (Musaffa screener): Sharia-compliant, Musaffa rating A/A+, analyst consensus
-    Buy/Strong Buy (stocks) &mdash; sorted by number of holdings (ETFs). Also excludes anything
-    on the BDS priority-boycott list or a major US DoD prime contractor. Every pick below
-    additionally passed a full dual-source compliance re-check (Musaffa + Halal Terminal, same
-    check held positions get) &mdash; anything that check couldn't confirm COMPLIANT, including
-    ETFs neither source can fully evaluate, is excluded rather than shown unverified.{amounts_note}
+    Buy/Strong Buy (stocks, min ${MIN_MARKET_CAP_USD:,.0f} market cap &mdash; Musaffa doesn't
+    expose analyst-coverage count, so this is a rough proxy against a single thinly-covered
+    analyst's opinion reading the same as a real consensus) &mdash; sorted by number of holdings
+    (ETFs). Also excludes anything on the BDS priority-boycott list or a major US DoD prime
+    contractor. Every pick below additionally passed a full dual-source compliance re-check
+    (Musaffa + Halal Terminal, same check held positions get) &mdash; anything that check
+    couldn't confirm COMPLIANT, including ETFs neither source can fully evaluate, is excluded
+    rather than shown unverified.{amounts_note}
   </p>
   <p style="font-size:12px;color:#9a6700;">
     Binance has no API for marking favorites &mdash; favorite these manually in the app: {favorite_list}
