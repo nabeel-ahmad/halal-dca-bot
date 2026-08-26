@@ -25,12 +25,15 @@ equity holdings:
      only linked for manual cross-check, not scraped.
      Any fetch failure, unrecognized page structure, or disagreement
      between sources is reported as UNKNOWN, not silently skipped — this
-     is exactly the case you'd want a human to look at. When Halal
-     Terminal's response carries an impure-income percentage, it's surfaced
-     per holding too (for dividend purification) — but that field name
-     hasn't been confirmed against a live response yet (see
-     check_halal_terminal's docstring), so treat it as a starting point to
-     verify, not a final number.
+     is exactly the case you'd want a human to look at. Halal Terminal's
+     purification_rate field is also surfaced per holding, along with an
+     estimated annual $ purification amount (current position value ×
+     dividend yield × purification rate) — this is an estimate, not an
+     exact figure, since this project doesn't track per-lot purchase dates
+     or actual dividend payouts received (unlike Musaffa's own purification
+     calculator at musaffa.com/purification/, which asks for those and
+     appears to require a logged-in/paid account to compute the real
+     number — not reproduced here).
 
   2. Mechanical concentration numbers: weight of each position, and a
      flag if any position exceeds CONCENTRATION_WARN_PCT of the portfolio.
@@ -179,15 +182,16 @@ def check_halal_terminal(ticker, asset_type="stock"):
         and catch a stale ticker-to-company mapping on either side (e.g. a
         renamed/re-purposed company still carrying a grade computed
         against its old business).
-      - "impure_income_pct": the share of income from non-compliant
-        activity, if the API exposes it under any of a few plausible field
-        names — used for dividend purification (the % of dividends from a
-        passing-but-not-fully-clean company that should be given away).
-        This project has not been able to confirm the real field name
-        against a live response (free-tier quota exhausted while writing
-        this) — treat a None here as "not confirmed yet", not "zero
-        impure income", and verify manually via the URL below until
-        confirmed against a real response."""
+      - "purification_pct": the API's own "purification_rate" field — the
+        percentage of income from non-compliant activity (confirmed live,
+        e.g. WST returned 0.56, matching its own interest_income_to_revenue
+        ratio of 0.5621%). This is the % of dividends from a
+        passing-but-not-fully-clean company that should be given away.
+      - "dividend_yield_pct": the API's own trailing dividend yield, used
+        together with purification_pct and the position's current value to
+        estimate an annual purification $ amount (see compute_rows) — an
+        estimate, not an exact figure, since this project doesn't track
+        per-lot purchase dates or actual historical dividend payouts."""
     if asset_type == "etf":
         url = f"https://api.halalterminal.com/api/etf/{ticker}/screen"
     else:
@@ -218,13 +222,8 @@ def check_halal_terminal(ticker, asset_type="stock"):
 
     metadata = {
         "name": data.get("name"),
-        # Field name unconfirmed against a live response — see docstring.
-        "impure_income_pct": (
-            data.get("impure_income_pct")
-            or data.get("non_compliant_income_percentage")
-            or data.get("purification_percentage")
-            or data.get("haram_income_pct")
-        ),
+        "purification_pct": data.get("purification_rate"),
+        "dividend_yield_pct": data.get("dividend_yield"),
     }
 
     # shariah_compliance_status is null on some cached rows (per the API's own
@@ -366,12 +365,22 @@ def compute_rows(holdings, prices):
             sell_reasons.append(f"halal rating downgraded to {halal_grade}")
         elif halal_grade == "UNKNOWN":
             sell_reasons.append("halal rating could not be verified this run — check manually")
-        impure_income_pct = sources.get("halal_terminal", (None, None, None, {}))[3].get("impure_income_pct")
+        halal_terminal_meta = sources.get("halal_terminal", (None, None, None, {}))[3]
+        purification_pct = halal_terminal_meta.get("purification_pct")
+        dividend_yield_pct = halal_terminal_meta.get("dividend_yield_pct")
+        # Estimated ANNUAL purification $ amount, not an exact historical
+        # figure — this project doesn't track per-lot purchase dates or
+        # actual dividend payouts received, so it approximates from current
+        # position value and the API's own trailing dividend yield instead.
+        purification_usd = None
+        if purification_pct is not None and dividend_yield_pct is not None:
+            purification_usd = value * (Decimal(str(dividend_yield_pct)) / 100) * (Decimal(str(purification_pct)) / 100)
         return {
             "ticker": ticker,
             "compliance": overall,
             "sources": sources,
-            "impure_income_pct": impure_income_pct,
+            "purification_pct": purification_pct,
+            "purification_usd": purification_usd,
             "value": value,
             "pct": pct if len(holdings) > 1 else Decimal("100"),
             "over_concentrated": over_concentrated,
@@ -435,11 +444,11 @@ def render_text(rows, total_value):
         lines.append(f"{r['ticker']}: {r['compliance']} | halal rating: {grade_note}")
         for source_name, (status, url, detail, _metadata) in r["sources"].items():
             lines.append(f"    {source_name}: {status} ({detail}) — {url}")
-        if r["impure_income_pct"] is not None:
-            lines.append(
-                f"    impure income: {r['impure_income_pct']}% — purify this share of dividends "
-                "(field name unconfirmed against a live API response, verify manually)"
-            )
+        if r["purification_pct"] is not None:
+            note = f"    purification rate: {r['purification_pct']}%"
+            if r["purification_usd"] is not None:
+                note += f" — est. ${r['purification_usd']:.2f}/yr to purify (annualized estimate, not exact — see README)"
+            lines.append(note)
         lines.append("    manual cross-check: " + " | ".join(MANUAL_LINKS))
         for f in r["ethics_flags"]:
             lines.append(f"    ⚠ {f['type']}: {f['detail']} — {f['source']}")
@@ -507,10 +516,14 @@ def render_html(rows, total_value):
             f'<a href="{url}" style="color:#57606a;text-decoration:none;">{escape(source_name)}: {SYMBOL[status]} {escape(detail)}</a>'
             for source_name, (status, url, detail, _metadata) in r["sources"].items()
         )
-        if r["impure_income_pct"] is not None:
+        if r["purification_pct"] is not None:
+            usd_note = (
+                f" &mdash; est. ${r['purification_usd']:.2f}/yr (annualized estimate, not exact)"
+                if r["purification_usd"] is not None else ""
+            )
             sources_html += (
-                f'<br><span style="color:#9a6700;">impure income: {escape(str(r["impure_income_pct"]))}% '
-                "&mdash; purify this share of dividends (field name unconfirmed, verify manually)</span>"
+                f'<br><span style="color:#9a6700;">purification rate: {escape(str(r["purification_pct"]))}%'
+                f"{usd_note}</span>"
             )
         ethics_html = ""
         if r["ethics_flags"]:
