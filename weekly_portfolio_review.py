@@ -458,6 +458,14 @@ def render_text(rows, total_value):
         lines.append(f"{r['ticker']}: ${r['value']:.2f} ({r['pct']}% of portfolio)")
     lines.append(f"\nTotal portfolio value: ${total_value:.2f}")
 
+    purification_total = sum((r["purification_usd"] for r in rows if r["purification_usd"] is not None), Decimal("0"))
+    priced_count = sum(1 for r in rows if r["purification_usd"] is not None)
+    if priced_count:
+        note = f"Total estimated purification: ${purification_total:.2f}/yr (annualized estimate, not exact — see README)"
+        if priced_count < len(rows):
+            note += f" — covers {priced_count}/{len(rows)} holdings; the rest had no purification data this run"
+        lines.append(note)
+
     return "\n".join(lines)
 
 
@@ -557,6 +565,19 @@ def render_html(rows, total_value):
 
     manual_links_html = " | ".join(f'<a href="{u}" style="color:#57606a;">{escape(u)}</a>' for u in MANUAL_LINKS)
 
+    purification_total = sum((r["purification_usd"] for r in rows if r["purification_usd"] is not None), Decimal("0"))
+    priced_count = sum(1 for r in rows if r["purification_usd"] is not None)
+    purification_total_html = ""
+    if priced_count:
+        coverage_note = (
+            f" &mdash; covers {priced_count}/{len(rows)} holdings; the rest had no purification data this run"
+            if priced_count < len(rows) else ""
+        )
+        purification_total_html = (
+            f'<p style="font-size:13px;color:#9a6700;">Total estimated purification: '
+            f"<b>${purification_total:.2f}/yr</b> (annualized estimate, not exact){coverage_note}</p>"
+        )
+
     sell_section = ""
     if flagged_sell:
         sell_section = f"""
@@ -609,6 +630,7 @@ def render_html(rows, total_value):
     </tbody>
   </table>
   <p style="font-size:13px;color:#57606a;">Total portfolio value: <b>${total_value:.2f}</b></p>
+  {purification_total_html}
 </div>
 """
 
