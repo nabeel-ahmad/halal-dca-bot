@@ -50,8 +50,12 @@ equity holdings:
      get, routed to each source's ETF-specific endpoint for ETFs — a
      candidate either source can't confirm COMPLIANT (including an ETF
      neither can fully evaluate) is dropped, not shown with an unverified
-     screener grade. A mechanical $ split of idle cash above your reserve
-     target follows.
+     screener grade. Also cross-checked: the company name Musaffa's screener
+     scraped against the one Halal Terminal's API independently reports for
+     the same ticker — a mismatch (a renamed or repurposed company whose
+     screener entry hasn't caught up) is dropped too, since the grade may
+     have been computed against the wrong business. A mechanical $ split of
+     idle cash above your reserve target follows.
 
 SECURITY: never hardcode credentials. Env vars pulled from binance_equity.py.
 """
@@ -113,28 +117,31 @@ def _strip_tags(html):
 
 def check_musaffa(ticker, asset_type="stock"):
     """musaffa.com/(stock|etf)/<TICKER> — FAQ text: '<TICKER> is classified as <status>'.
-    Must use the /etf/ path for ETFs — the /stock/ page 404s for them."""
+    Must use the /etf/ path for ETFs — the /stock/ page 404s for them.
+    Returns (status, url, detail, name) — name is always None here; this
+    scrape doesn't parse the page's own company-name text, unlike Halal
+    Terminal's JSON which hands it back directly."""
     path = "etf" if asset_type == "etf" else "stock"
     url = f"https://musaffa.com/{path}/{ticker}"
     try:
         resp = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=HTTP_TIMEOUT)
         resp.raise_for_status()
     except requests.RequestException as e:
-        return UNKNOWN, url, f"fetch failed: {e}"
+        return UNKNOWN, url, f"fetch failed: {e}", None
 
     if ticker.upper() not in resp.text.upper():
-        return UNKNOWN, url, "ticker not found on page"
+        return UNKNOWN, url, "ticker not found on page", None
 
     text = _strip_tags(resp.text)
     m = re.search(r"classified as\s+([a-z\- ]+?)(?:\.|,| according| by)", text, re.I)
     if not m:
-        return UNKNOWN, url, "compliance phrase not found"
+        return UNKNOWN, url, "compliance phrase not found", None
     status = m.group(1).strip().lower()
     if status == "halal":
-        return COMPLIANT, url, status
+        return COMPLIANT, url, status, None
     if status in ("not halal", "haram", "doubtful", "non-compliant"):
-        return NON_COMPLIANT, url, status
-    return UNKNOWN, url, f"unrecognized status text: {status!r}"
+        return NON_COMPLIANT, url, status, None
+    return UNKNOWN, url, f"unrecognized status text: {status!r}", None
 
 
 def check_halal_terminal(ticker, asset_type="stock"):
@@ -149,42 +156,50 @@ def check_halal_terminal(ticker, asset_type="stock"):
     Use /api/etf/{symbol}/screen for holdings-based compliance"), and the
     two previously being conflated is why ETF candidates showed a
     confident-looking grade despite neither compliance source having
-    actually evaluated them."""
+    actually evaluated them.
+
+    Returns (status, url, detail, name) — name is the company name the API
+    itself reports for the ticker (None if unavailable), used to cross-check
+    against Musaffa's independently-scraped name and catch a stale
+    ticker-to-company mapping on either side (e.g. a renamed/re-purposed
+    company still carrying a grade computed against its old business)."""
     if asset_type == "etf":
         url = f"https://api.halalterminal.com/api/etf/{ticker}/screen"
     else:
         url = f"https://api.halalterminal.com/api/screen/{ticker}"
     if not HALAL_TERMINAL_API_KEY:
-        return UNKNOWN, url, "HALAL_TERMINAL_API_KEY not set — skipped"
+        return UNKNOWN, url, "HALAL_TERMINAL_API_KEY not set — skipped", None
     try:
         resp = requests.post(url, headers={"X-API-Key": HALAL_TERMINAL_API_KEY}, timeout=HTTP_TIMEOUT)
     except requests.RequestException as e:
-        return UNKNOWN, url, f"fetch failed: {e}"
+        return UNKNOWN, url, f"fetch failed: {e}", None
 
     if resp.status_code == 401:
-        return UNKNOWN, url, "API key missing or invalid"
+        return UNKNOWN, url, "API key missing or invalid", None
     if resp.status_code == 429:
-        return UNKNOWN, url, "quota exceeded"
+        return UNKNOWN, url, "quota exceeded", None
     try:
         resp.raise_for_status()
         data = resp.json()
     except (requests.RequestException, ValueError) as e:
-        return UNKNOWN, url, f"fetch failed: {e}"
+        return UNKNOWN, url, f"fetch failed: {e}", None
+
+    name = data.get("name")
 
     # shariah_compliance_status is null on some cached rows (per the API's own
     # schema notes) — is_compliant is the boolean field that's actually
     # populated then, so fall back to it before giving up as UNKNOWN.
     status = data.get("shariah_compliance_status")
     if status == "compliant":
-        return COMPLIANT, url, status
+        return COMPLIANT, url, status, name
     if status == "non_compliant":
-        return NON_COMPLIANT, url, status
+        return NON_COMPLIANT, url, status, name
     is_compliant = data.get("is_compliant")
     if is_compliant is True:
-        return COMPLIANT, url, "is_compliant=true"
+        return COMPLIANT, url, "is_compliant=true", name
     if is_compliant is False:
-        return NON_COMPLIANT, url, "is_compliant=false"
-    return UNKNOWN, url, data.get("error_message") or status or "insufficient data"
+        return NON_COMPLIANT, url, "is_compliant=false", name
+    return UNKNOWN, url, data.get("error_message") or status or "insufficient data", name
 
 
 def check_compliance(ticker, asset_type="stock"):
@@ -205,6 +220,28 @@ def check_compliance(ticker, asset_type="stock"):
     return overall, results
 
 
+_CORP_SUFFIXES = {
+    "inc", "incorporated", "corp", "corporation", "co", "company", "ltd",
+    "limited", "plc", "holdings", "holding", "group", "trust", "the",
+}
+
+
+def _significant_words(name):
+    words = re.findall(r"[a-z0-9]+", (name or "").lower())
+    return {w for w in words if w not in _CORP_SUFFIXES}
+
+
+def _names_plausibly_match(a, b):
+    """Loose same-company check after stripping generic corporate suffixes
+    ('Holdings', 'Inc', ...) that would otherwise overlap for two unrelated
+    companies. Missing data on either side isn't treated as a mismatch —
+    only an actual disagreement between two independent sources is."""
+    wa, wb = _significant_words(a), _significant_words(b)
+    if not wa or not wb:
+        return True
+    return bool(wa & wb)
+
+
 def get_verified_compliant_tickers(candidates):
     """Runs the full dual-source check_compliance() (same one used for held
     positions) against each new-money candidate, keyed to its own asset_type
@@ -214,11 +251,35 @@ def get_verified_compliant_tickers(candidates):
     NON_COMPLIANT, not defaulted through. The screener's own scraped letter
     grade is not a substitute for this — it's a different, unverified
     pipeline (see check_musaffa/check_halal_terminal vs.
-    musaffa_recommendations.enrich_with_halal_grade)."""
+    musaffa_recommendations.enrich_with_halal_grade).
+
+    Also cross-checks the candidate's own Musaffa-scraped company name
+    against the company name Halal Terminal's API independently reports for
+    the same ticker. A renamed/repurposed company (a ticker whose business
+    changed but whose screener entry didn't catch up) shows up as exactly
+    this: two sources disagreeing on what company the ticker even is. A
+    mismatch is excluded rather than trusted, since the grade may have been
+    computed against stale business data."""
     candidates = list(candidates)
     with ThreadPoolExecutor(max_workers=min(TICKER_FETCH_WORKERS, len(candidates) or 1)) as pool:
-        results = pool.map(lambda c: (c["ticker"], check_compliance(c["ticker"], c["asset_type"])[0]), candidates)
-    return {ticker for ticker, overall in results if overall == COMPLIANT}
+        results = list(pool.map(lambda c: (c, check_compliance(c["ticker"], c["asset_type"])), candidates))
+
+    verified = set()
+    for candidate, (overall, sources) in results:
+        ticker = candidate["ticker"]
+        if overall != COMPLIANT:
+            continue
+        halal_terminal_name = sources.get("halal_terminal", (None, None, None, None))[3]
+        if halal_terminal_name and not _names_plausibly_match(candidate.get("name"), halal_terminal_name):
+            print(
+                f"Note: {ticker} excluded from candidates — name mismatch between Musaffa "
+                f"({candidate.get('name')!r}) and Halal Terminal ({halal_terminal_name!r}); "
+                "likely a stale ticker-to-company mapping on one side.",
+                file=sys.stderr,
+            )
+            continue
+        verified.add(ticker)
+    return verified
 
 
 SYMBOL = {COMPLIANT: "✅", NON_COMPLIANT: "❌", UNKNOWN: "⚠️"}
@@ -273,6 +334,12 @@ def compute_rows(holdings, prices):
             "over_concentrated": over_concentrated,
             "ethics_flags": ethics_flags,
             "halal_grade": halal_grade,
+            # The grade comes from a separate pipeline (a screener-table
+            # scrape) than compliance (direct Musaffa/Halal Terminal
+            # lookups) — nothing reconciles them. A confident-looking grade
+            # next to an UNKNOWN compliance result is not itself verified,
+            # so callers must not display the grade as if it were.
+            "halal_grade_verified": overall != UNKNOWN,
             "sell_reasons": sell_reasons,
         }
 
@@ -319,9 +386,12 @@ def render_text(rows, total_value):
 
     lines.append("\n=== Sharia compliance re-check ===\n")
     for r in rows:
-        lines.append(f"{r['ticker']}: {r['compliance']} | halal rating: {r['halal_grade']}")
-        for name, (status, url, detail) in r["sources"].items():
-            lines.append(f"    {name}: {status} ({detail}) — {url}")
+        grade_note = r["halal_grade"]
+        if r["halal_grade"] != "UNKNOWN" and not r["halal_grade_verified"]:
+            grade_note += " (screener-scraped, unverified — compliance sources returned UNKNOWN)"
+        lines.append(f"{r['ticker']}: {r['compliance']} | halal rating: {grade_note}")
+        for source_name, (status, url, detail, _company_name) in r["sources"].items():
+            lines.append(f"    {source_name}: {status} ({detail}) — {url}")
         lines.append("    manual cross-check: " + " | ".join(MANUAL_LINKS))
         for f in r["ethics_flags"]:
             lines.append(f"    ⚠ {f['type']}: {f['detail']} — {f['source']}")
@@ -386,8 +456,8 @@ def render_html(rows, total_value):
 
     def compliance_row(r):
         sources_html = "<br>".join(
-            f'<a href="{url}" style="color:#57606a;text-decoration:none;">{escape(name)}: {SYMBOL[status]} {escape(detail)}</a>'
-            for name, (status, url, detail) in r["sources"].items()
+            f'<a href="{url}" style="color:#57606a;text-decoration:none;">{escape(source_name)}: {SYMBOL[status]} {escape(detail)}</a>'
+            for source_name, (status, url, detail, _company_name) in r["sources"].items()
         )
         ethics_html = ""
         if r["ethics_flags"]:
@@ -398,7 +468,13 @@ def render_html(rows, total_value):
             "<tr>"
             f'<td style="padding:8px;border-bottom:1px solid #d0d7de;font-weight:600;">{escape(r["ticker"])}</td>'
             f'<td style="padding:8px;border-bottom:1px solid #d0d7de;">{badge(r["compliance"])}</td>'
-            f'<td style="padding:8px;border-bottom:1px solid #d0d7de;">{escape(r["halal_grade"])}</td>'
+            f'<td style="padding:8px;border-bottom:1px solid #d0d7de;">{escape(r["halal_grade"])}'
+            + (
+                '<br><span style="font-size:11px;color:#9a6700;">(screener-scraped, unverified &mdash; '
+                "compliance sources returned UNKNOWN)</span>"
+                if r["halal_grade"] != "UNKNOWN" and not r["halal_grade_verified"] else ""
+            )
+            + "</td>"
             f'<td style="padding:8px;border-bottom:1px solid #d0d7de;font-size:12px;">{sources_html}{ethics_html}</td>'
             "</tr>"
         )
