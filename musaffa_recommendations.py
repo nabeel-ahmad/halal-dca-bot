@@ -136,14 +136,24 @@ def get_halal_grades(tickers, timeout_ms=12000, max_workers=GRADE_FETCH_WORKERS)
     holdings response doesn't distinguish stock vs ETF). Tries the /stock/
     detail page first, falling back to /etf/ if that comes back UNKNOWN.
     Fetched concurrently (one browser per worker thread). Used to re-check
-    existing holdings for a grade downgrade, not just new candidates."""
+    existing holdings for a grade downgrade, not just new candidates.
+
+    Returns {ticker: (grade, asset_type)} — asset_type is whichever path
+    produced a real grade ("stock" if neither did, since that's the more
+    common case and it's an arbitrary default either way once both fail).
+    Callers reuse asset_type to route the separate compliance check
+    (Musaffa/Halal Terminal) to the right endpoint instead of guessing
+    "stock" independently and 404ing on ETF holdings."""
     tickers = list(tickers)
 
     def fetch(ticker):
         grade = _fetch_grade_standalone(f"https://musaffa.com/stock/{ticker}", timeout_ms)
+        asset_type = "stock"
         if grade == "UNKNOWN":
-            grade = _fetch_grade_standalone(f"https://musaffa.com/etf/{ticker}", timeout_ms)
-        return ticker, grade
+            etf_grade = _fetch_grade_standalone(f"https://musaffa.com/etf/{ticker}", timeout_ms)
+            if etf_grade != "UNKNOWN":
+                grade, asset_type = etf_grade, "etf"
+        return ticker, (grade, asset_type)
 
     with ThreadPoolExecutor(max_workers=min(max_workers, len(tickers) or 1)) as pool:
         return dict(pool.map(fetch, tickers))

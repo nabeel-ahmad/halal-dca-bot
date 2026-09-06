@@ -282,7 +282,7 @@ def _names_plausibly_match(a, b):
     return bool(wa & wb)
 
 
-def get_verified_compliant_tickers(candidates):
+def get_verified_compliant_tickers(candidates, target=None):
     """Runs the full dual-source check_compliance() (same one used for held
     positions) against each new-money candidate, keyed to its own asset_type
     so ETFs hit the ETF endpoint instead of the stock one. Only tickers both
@@ -299,26 +299,40 @@ def get_verified_compliant_tickers(candidates):
     changed but whose screener entry didn't catch up) shows up as exactly
     this: two sources disagreeing on what company the ticker even is. A
     mismatch is excluded rather than trusted, since the grade may have been
-    computed against stale business data."""
+    computed against stale business data.
+
+    candidates is consumed in the order given (Musaffa's own rank order) in
+    batches of `target` size, stopping as soon as `target` tickers verify —
+    Halal Terminal is rate/quota-limited, so an overfetched candidate pool
+    (see compute_recommendations) shouldn't all get checked against it
+    up front when the first batch is usually enough. target=None (or
+    unbounded attrition) falls back to checking everything, same as before."""
     candidates = list(candidates)
-    with ThreadPoolExecutor(max_workers=min(TICKER_FETCH_WORKERS, len(candidates) or 1)) as pool:
-        results = list(pool.map(lambda c: (c, check_compliance(c["ticker"], c["asset_type"])), candidates))
+    if target is None:
+        target = len(candidates)
 
     verified = set()
-    for candidate, (overall, sources) in results:
-        ticker = candidate["ticker"]
-        if overall != COMPLIANT:
-            continue
-        halal_terminal_name = sources.get("halal_terminal", (None, None, None, {}))[3].get("name")
-        if halal_terminal_name and not _names_plausibly_match(candidate.get("name"), halal_terminal_name):
-            print(
-                f"Note: {ticker} excluded from candidates — name mismatch between Musaffa "
-                f"({candidate.get('name')!r}) and Halal Terminal ({halal_terminal_name!r}); "
-                "likely a stale ticker-to-company mapping on one side.",
-                file=sys.stderr,
-            )
-            continue
-        verified.add(ticker)
+    for start in range(0, len(candidates), max(target, 1)):
+        if len(verified) >= target:
+            break
+        batch = candidates[start:start + target]
+        with ThreadPoolExecutor(max_workers=min(TICKER_FETCH_WORKERS, len(batch) or 1)) as pool:
+            results = list(pool.map(lambda c: (c, check_compliance(c["ticker"], c["asset_type"])), batch))
+
+        for candidate, (overall, sources) in results:
+            ticker = candidate["ticker"]
+            if overall != COMPLIANT:
+                continue
+            halal_terminal_name = sources.get("halal_terminal", (None, None, None, {}))[3].get("name")
+            if halal_terminal_name and not _names_plausibly_match(candidate.get("name"), halal_terminal_name):
+                print(
+                    f"Note: {ticker} excluded from candidates — name mismatch between Musaffa "
+                    f"({candidate.get('name')!r}) and Halal Terminal ({halal_terminal_name!r}); "
+                    "likely a stale ticker-to-company mapping on one side.",
+                    file=sys.stderr,
+                )
+                continue
+            verified.add(ticker)
     return verified
 
 
@@ -350,11 +364,11 @@ def compute_rows(holdings, prices):
 
     def build_row(item):
         ticker, qty = item
-        overall, sources = check_compliance(ticker)
+        halal_grade, asset_type = halal_grades.get(ticker, ("UNKNOWN", "stock"))
+        overall, sources = check_compliance(ticker, asset_type)
         value = qty * prices[ticker]
         pct = (value / total_value * 100).quantize(Decimal("0.1"), rounding=ROUND_HALF_UP) if total_value else Decimal("0")
         over_concentrated = pct > CONCENTRATION_WARN_PCT or len(holdings) == 1
-        halal_grade = halal_grades.get(ticker, "UNKNOWN")
         sell_reasons = []
         if overall == NON_COMPLIANT:
             sell_reasons.append("no longer Sharia-compliant")
@@ -679,7 +693,15 @@ def compute_recommendations(stablecoin_balance):
     # get — not just a Halal Terminal non-compliant filter. A candidate whose
     # sources can't actually evaluate it (e.g. an ETF the screen endpoint
     # declines) is excluded, not shown with an unverified "A" grade.
-    verified_compliant = get_verified_compliant_tickers([c for c in candidates if c["ticker"] in tradable])
+    # Checked separately per asset type (each with its own pick target) and
+    # incrementally in rank order, so the 4x overfetch above only spends
+    # Halal Terminal quota on as many candidates as attrition actually
+    # requires instead of the whole speculative pool.
+    verified_compliant = get_verified_compliant_tickers(
+        [c for c in stocks if c["ticker"] in tradable], target=NUM_STOCK_PICKS
+    ) | get_verified_compliant_tickers(
+        [c for c in etfs if c["ticker"] in tradable], target=NUM_ETF_PICKS
+    )
     keep = tradable & verified_compliant
     stocks = [c for c in stocks if c["ticker"] in keep][:NUM_STOCK_PICKS]
     etfs = [c for c in etfs if c["ticker"] in keep][:NUM_ETF_PICKS]
