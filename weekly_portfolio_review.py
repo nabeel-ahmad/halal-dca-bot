@@ -126,6 +126,14 @@ USER_AGENT = (
 )
 
 COMPLIANT, NON_COMPLIANT, UNKNOWN = "COMPLIANT", "NON_COMPLIANT", "UNKNOWN"
+# A source's own status, not an overall verdict: the source couldn't be
+# queried at all (network error, bad/missing key, quota exhausted, skipped
+# for DRY_RUN) as opposed to UNKNOWN, where it *was* queried and responded
+# but couldn't evaluate this particular security. check_compliance() ignores
+# UNREACHABLE sources when aggregating instead of treating them as a
+# disagreement, so a source being down doesn't block a verdict the other
+# source(s) can still give.
+UNREACHABLE = "UNREACHABLE"
 
 
 def _strip_tags(html):
@@ -197,28 +205,28 @@ def check_halal_terminal(ticker, asset_type="stock"):
     else:
         url = f"https://api.halalterminal.com/api/screen/{ticker}"
     if not HALAL_TERMINAL_API_KEY:
-        return UNKNOWN, url, "HALAL_TERMINAL_API_KEY not set — skipped", {}
+        return UNREACHABLE, url, "HALAL_TERMINAL_API_KEY not set — skipped", {}
     if os.environ.get("DRY_RUN") == "1":
         # The free tier is a hard 500-token monthly cap, not a per-day
         # allowance — a handful of manual dry runs during development can
         # exhaust it for the rest of the period. Dry runs are for checking
         # rendering/logic, not for validating live compliance data, so skip
         # the call entirely rather than spend quota on it.
-        return UNKNOWN, url, "DRY_RUN=1 — Halal Terminal call skipped to conserve quota", {}
+        return UNREACHABLE, url, "DRY_RUN=1 — Halal Terminal call skipped to conserve quota", {}
     try:
         resp = requests.post(url, headers={"X-API-Key": HALAL_TERMINAL_API_KEY}, timeout=HTTP_TIMEOUT)
     except requests.RequestException as e:
-        return UNKNOWN, url, f"fetch failed: {e}", {}
+        return UNREACHABLE, url, f"fetch failed: {e}", {}
 
     if resp.status_code == 401:
-        return UNKNOWN, url, "API key missing or invalid", {}
+        return UNREACHABLE, url, "API key missing or invalid", {}
     if resp.status_code == 429:
-        return UNKNOWN, url, "quota exceeded", {}
+        return UNREACHABLE, url, "quota exceeded", {}
     try:
         resp.raise_for_status()
         data = resp.json()
     except (requests.RequestException, ValueError) as e:
-        return UNKNOWN, url, f"fetch failed: {e}", {}
+        return UNREACHABLE, url, f"fetch failed: {e}", {}
 
     metadata = {
         "name": data.get("name"),
@@ -250,13 +258,18 @@ def check_compliance(ticker, asset_type="stock"):
         futures = {name: pool.submit(fn, ticker, asset_type) for name, fn in checks.items()}
         results = {name: future.result() for name, future in futures.items()}
 
-    statuses = {v[0] for v in results.values()}
-    if NON_COMPLIANT in statuses:
+    # A source that was UNREACHABLE (down, unauthorized, out of quota, or
+    # skipped) never got to render an opinion, so it's excluded from the
+    # verdict rather than counted as a disagreement — otherwise Halal
+    # Terminal's quota running out would silently blank every candidate and
+    # holding Musaffa itself was able to confirm.
+    reachable_statuses = {v[0] for v in results.values() if v[0] != UNREACHABLE}
+    if NON_COMPLIANT in reachable_statuses:
         overall = NON_COMPLIANT
-    elif statuses == {COMPLIANT}:
+    elif reachable_statuses == {COMPLIANT}:
         overall = COMPLIANT
     else:
-        overall = UNKNOWN  # any disagreement or fetch failure — flag for manual review
+        overall = UNKNOWN  # no source reached a verdict, or the ones that did disagree
     return overall, results
 
 
@@ -285,12 +298,15 @@ def _names_plausibly_match(a, b):
 def get_verified_compliant_tickers(candidates, target=None):
     """Runs the full dual-source check_compliance() (same one used for held
     positions) against each new-money candidate, keyed to its own asset_type
-    so ETFs hit the ETF endpoint instead of the stock one. Only tickers both
-    sources actually confirm COMPLIANT pass — an UNKNOWN (declined/failed
-    to evaluate, e.g. an ETF with no working screen) is excluded same as a
-    NON_COMPLIANT, not defaulted through. The screener's own scraped letter
-    grade is not a substitute for this — it's a different, unverified
-    pipeline (see check_musaffa/check_halal_terminal vs.
+    so ETFs hit the ETF endpoint instead of the stock one. A ticker passes
+    once every source that was actually reachable agrees COMPLIANT — a
+    source that responded but declined to evaluate it (e.g. an ETF the
+    screen endpoint can't handle) excludes it same as a NON_COMPLIANT, not
+    defaulted through, but a source that was UNREACHABLE (Halal Terminal
+    down, out of quota, or unconfigured) does not, and is instead noted via
+    candidate["compliance_note"] — see check_compliance. The screener's own
+    scraped letter grade is not a substitute for this — it's a different,
+    unverified pipeline (see check_musaffa/check_halal_terminal vs.
     musaffa_recommendations.enrich_with_halal_grade).
 
     Also cross-checks the candidate's own Musaffa-scraped company name
@@ -332,13 +348,19 @@ def get_verified_compliant_tickers(candidates, target=None):
                     file=sys.stderr,
                 )
                 continue
+            halal_terminal_status = sources.get("halal_terminal", (None,))[0]
+            if halal_terminal_status == UNREACHABLE:
+                candidate["compliance_note"] = (
+                    "Halal Terminal unreachable this run — verified against Musaffa only, "
+                    "not cross-checked"
+                )
             verified.add(ticker)
     return verified
 
 
-SYMBOL = {COMPLIANT: "✅", NON_COMPLIANT: "❌", UNKNOWN: "⚠️"}
-COLOR = {COMPLIANT: "#1a7f37", NON_COMPLIANT: "#cf222e", UNKNOWN: "#9a6700"}
-BADGE_BG = {COMPLIANT: "#dafbe1", NON_COMPLIANT: "#ffebe9", UNKNOWN: "#fff8c5"}
+SYMBOL = {COMPLIANT: "✅", NON_COMPLIANT: "❌", UNKNOWN: "⚠️", UNREACHABLE: "🔌"}
+COLOR = {COMPLIANT: "#1a7f37", NON_COMPLIANT: "#cf222e", UNKNOWN: "#9a6700", UNREACHABLE: "#9a6700"}
+BADGE_BG = {COMPLIANT: "#dafbe1", NON_COMPLIANT: "#ffebe9", UNKNOWN: "#fff8c5", UNREACHABLE: "#fff8c5"}
 
 MANUAL_LINKS = (
     "https://hyssa.com/en/how-to-start/explore-halal-screened-stocks",
@@ -757,6 +779,8 @@ def render_recommendations_text(rec, include_amounts=True):
                 f"segment: {p['segment']}{suggested} | "
                 f"buy on Binance: {p['binance_url']}"
             )
+        if p.get("compliance_note"):
+            lines.append(f"        note: {p['compliance_note']}")
     lines.append(
         "\nFilter applied (Musaffa screener): Sharia-compliant, Musaffa rating A/A+, "
         f"analyst consensus Buy/Strong Buy (stocks, min ${MIN_MARKET_CAP_USD:,.0f} market cap — "
@@ -765,8 +789,10 @@ def render_recommendations_text(rec, include_amounts=True):
         "of holdings (ETFs). Also excludes anything on the BDS priority-boycott list or a major US "
         "DoD prime contractor (see ethics_screens.py). Every pick below additionally passed a full "
         "dual-source compliance re-check (Musaffa + Halal Terminal, same check held positions "
-        "get) — anything that check couldn't confirm COMPLIANT, including ETFs neither source "
-        "can fully evaluate, is excluded rather than shown unverified."
+        "get) — anything a reachable source actively disputed or declined to evaluate, including "
+        "ETFs neither source can fully evaluate, is excluded rather than shown unverified. If "
+        "Halal Terminal itself was unreachable (down, out of quota, unconfigured) that pick still "
+        "shows, flagged with a note, rather than being dropped for a problem on our end."
     )
     lines.append(
         "Binance has no API for marking favorites — favorite these manually in the app: "
@@ -805,7 +831,12 @@ def render_recommendations_html(rec, include_amounts=True):
             f'<td style="padding:8px;border-bottom:1px solid #d0d7de;font-weight:600;">{ticker_cell}</td>'
             f'<td style="padding:8px;border-bottom:1px solid #d0d7de;">{type_badge}</td>'
             f'<td style="padding:8px;border-bottom:1px solid #d0d7de;">{grade_badge(p)}</td>'
-            f'<td style="padding:8px;border-bottom:1px solid #d0d7de;font-size:12px;">{escape(p["name"])}<br>{detail}</td>'
+            f'<td style="padding:8px;border-bottom:1px solid #d0d7de;font-size:12px;">{escape(p["name"])}<br>{detail}'
+            + (
+                f'<br><span style="color:#9a6700;">🔌 {escape(p["compliance_note"])}</span>'
+                if p.get("compliance_note") else ""
+            )
+            + "</td>"
             f"{amount_cell}"
             "</tr>"
         )
@@ -860,9 +891,11 @@ def render_recommendations_html(rec, include_amounts=True):
     analyst's opinion reading the same as a real consensus) &mdash; sorted by number of holdings
     (ETFs). Also excludes anything on the BDS priority-boycott list or a major US DoD prime
     contractor. Every pick below additionally passed a full dual-source compliance re-check
-    (Musaffa + Halal Terminal, same check held positions get) &mdash; anything that check
-    couldn't confirm COMPLIANT, including ETFs neither source can fully evaluate, is excluded
-    rather than shown unverified.{amounts_note}
+    (Musaffa + Halal Terminal, same check held positions get) &mdash; anything a reachable source
+    actively disputed or declined to evaluate, including ETFs neither source can fully evaluate,
+    is excluded rather than shown unverified. If Halal Terminal itself was unreachable (down, out
+    of quota, unconfigured) that pick still shows, flagged with a note, rather than being dropped
+    for a problem on our end.{amounts_note}
   </p>
   <p style="font-size:12px;color:#9a6700;">
     Binance has no API for marking favorites &mdash; favorite these manually in the app: {favorite_list}
