@@ -121,7 +121,7 @@ def enrich_with_halal_grade(picks, timeout_ms=12000, max_workers=GRADE_FETCH_WOR
     fine for the ~10 picks this runs against, not meant for scanning the
     whole screener."""
     urls = [
-        f"https://musaffa.com/{'etf' if p['asset_type'] == 'etf' else 'stock'}/{p['ticker']}"
+        f"https://musaffa.com/{'etf' if p['asset_type'] == 'etf' else 'stock'}/{p['ticker']}/"
         for p in picks
     ]
     with ThreadPoolExecutor(max_workers=min(max_workers, len(picks) or 1)) as pool:
@@ -147,10 +147,10 @@ def get_halal_grades(tickers, timeout_ms=12000, max_workers=GRADE_FETCH_WORKERS)
     tickers = list(tickers)
 
     def fetch(ticker):
-        grade = _fetch_grade_standalone(f"https://musaffa.com/stock/{ticker}", timeout_ms)
+        grade = _fetch_grade_standalone(f"https://musaffa.com/stock/{ticker}/", timeout_ms)
         asset_type = "stock"
         if grade == "UNKNOWN":
-            etf_grade = _fetch_grade_standalone(f"https://musaffa.com/etf/{ticker}", timeout_ms)
+            etf_grade = _fetch_grade_standalone(f"https://musaffa.com/etf/{ticker}/", timeout_ms)
             if etf_grade != "UNKNOWN":
                 grade, asset_type = etf_grade, "etf"
         return ticker, (grade, asset_type)

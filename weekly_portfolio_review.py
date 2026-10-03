@@ -147,7 +147,7 @@ def check_musaffa(ticker, asset_type="stock"):
     this scrape doesn't parse the page's own company-name or impure-income
     data, unlike Halal Terminal's JSON which hands both back directly."""
     path = "etf" if asset_type == "etf" else "stock"
-    url = f"https://musaffa.com/{path}/{ticker}"
+    url = f"https://musaffa.com/{path}/{ticker}/"
     try:
         resp = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=HTTP_TIMEOUT)
         resp.raise_for_status()
@@ -731,7 +731,7 @@ def compute_recommendations(stablecoin_balance):
     enrich_with_halal_grade(picks)
     for p in picks:
         path = "etf" if p["asset_type"] == "etf" else "stock"
-        p["musaffa_url"] = f"https://musaffa.com/{path}/{p['ticker']}"
+        p["musaffa_url"] = f"https://musaffa.com/{path}/{p['ticker']}/"
         p["binance_url"] = f"https://www.binance.com/en/stocks/EQ_{p['ticker']}"
 
     investable = max(Decimal("0"), stablecoin_balance - CASH_RESERVE_TARGET_USD)
