@@ -56,6 +56,13 @@ instead. That means:
    halalterminal.com for a free-tier API key, then add it as the
    `HALAL_TERMINAL_API_KEY` repo secret (and/or your local `.env`). Leave it
    unset and the review just runs on Musaffa alone as before.
+   To protect the free tier's 500-call cap, Halal Terminal is only consulted
+   for stocks Musaffa already reports COMPLIANT (a second layer of defence; ETFs
+   are Musaffa-only, set `HALAL_TERMINAL_ETFS=1` to re-enable),
+   and each answer is cached for 30 days (7 for UNKNOWN) in
+   `~/.cache/halal-dca-bot/halal_terminal_cache.json` — outside the checkout so
+   `actions/checkout` doesn't wipe it. Override with `HALAL_TERMINAL_CACHE_PATH` /
+   `HALAL_TERMINAL_CACHE_TTL_DAYS`; delete the file to force a refresh.
 
 ## Consider-selling list
 

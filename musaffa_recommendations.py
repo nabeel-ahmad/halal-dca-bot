@@ -24,6 +24,7 @@ resulting URL.
 import re
 from concurrent.futures import ThreadPoolExecutor
 
+import requests
 from playwright.sync_api import sync_playwright
 
 GRADE_FETCH_WORKERS = 5
@@ -147,9 +148,22 @@ def get_halal_grades(tickers, timeout_ms=12000, max_workers=GRADE_FETCH_WORKERS)
     tickers = list(tickers)
 
     def fetch(ticker):
-        grade = _fetch_grade_standalone(f"https://musaffa.com/stock/{ticker}/", timeout_ms)
+        # ETF detail pages are 200 but carry no public letter grade (only a
+        # "classified as halal" sentence), so grade == UNKNOWN can't tell an
+        # ETF from a failed scrape. The /stock/ path 404s for ETFs, so that
+        # status is the reliable stock-vs-ETF signal.
+        stock_url = f"https://musaffa.com/stock/{ticker}/"
+        try:
+            status = requests.get(
+                stock_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15, allow_redirects=False
+            ).status_code
+        except requests.RequestException:
+            status = None
+        if status == 404:
+            return ticker, (_fetch_grade_standalone(f"https://musaffa.com/etf/{ticker}/", timeout_ms), "etf")
+        grade = _fetch_grade_standalone(stock_url, timeout_ms)
         asset_type = "stock"
-        if grade == "UNKNOWN":
+        if grade == "UNKNOWN" and status is None:
             etf_grade = _fetch_grade_standalone(f"https://musaffa.com/etf/{ticker}/", timeout_ms)
             if etf_grade != "UNKNOWN":
                 grade, asset_type = etf_grade, "etf"

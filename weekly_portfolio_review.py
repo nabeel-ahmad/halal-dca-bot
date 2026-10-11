@@ -71,10 +71,13 @@ equity holdings:
 SECURITY: never hardcode credentials. Env vars pulled from binance_equity.py.
 """
 
+import json
 import os
 import re
 import smtplib
 import sys
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal, ROUND_HALF_UP
 from email.mime.multipart import MIMEMultipart
@@ -120,6 +123,24 @@ NUM_ETF_PICKS = int(os.environ.get("NUM_ETF_PICKS", "3"))
 MIN_MARKET_CAP_USD = Decimal(os.environ.get("MIN_MARKET_CAP_USD", "2000000000"))
 HALAL_TERMINAL_API_KEY = os.environ.get("HALAL_TERMINAL_API_KEY", "")
 HTTP_TIMEOUT = 10
+# Halal Terminal's free tier is a hard 500-call cap, so every answer is cached
+# on disk and reused across runs (weekly run, retries, manual triggers). Lives
+# outside the repo checkout on purpose: actions/checkout runs `git clean -ffdx`
+# on the self-hosted runner, which would wipe an ignored file inside it.
+HALAL_TERMINAL_CACHE_PATH = os.path.expanduser(
+    os.environ.get("HALAL_TERMINAL_CACHE_PATH", "~/.cache/halal-dca-bot/halal_terminal_cache.json")
+)
+# Compliance/purification data moves on quarterly filings, so a month is safe.
+# UNKNOWN (responded but couldn't evaluate) gets a short TTL in case it was
+# transient "insufficient data" rather than a stable answer.
+HALAL_TERMINAL_CACHE_TTL_S = int(os.environ.get("HALAL_TERMINAL_CACHE_TTL_DAYS", "30")) * 86400
+HALAL_TERMINAL_UNKNOWN_TTL_S = 7 * 86400
+_cache_lock = threading.Lock()
+# Halal Terminal's stock endpoint refuses ETFs outright ("stock-screen endpoint
+# cannot evaluate compliance"), and the ETF endpoint has only ever answered
+# UNKNOWN/insufficient data in practice, so ETFs are Musaffa-only. Set
+# HALAL_TERMINAL_ETFS=1 to consult the ETF endpoint again.
+HALAL_TERMINAL_ETFS = os.environ.get("HALAL_TERMINAL_ETFS") == "1"
 USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
@@ -169,6 +190,51 @@ def check_musaffa(ticker, asset_type="stock"):
     return UNKNOWN, url, f"unrecognized status text: {status!r}", {}
 
 
+def _cache_key(ticker, asset_type):
+    return f"{asset_type}:{ticker}"
+
+
+def _cache_load():
+    try:
+        with open(HALAL_TERMINAL_CACHE_PATH) as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _cache_get(ticker, asset_type):
+    """Returns the cached (status, detail, metadata) if still fresh, else None."""
+    with _cache_lock:
+        entry = _cache_load().get(_cache_key(ticker, asset_type))
+    if not entry:
+        return None
+    ttl = HALAL_TERMINAL_UNKNOWN_TTL_S if entry.get("status") == UNKNOWN else HALAL_TERMINAL_CACHE_TTL_S
+    if time.time() - entry.get("ts", 0) > ttl:
+        return None
+    return entry["status"], entry.get("detail"), entry.get("metadata") or {}
+
+
+def _cache_put(ticker, asset_type, status, detail, metadata):
+    """Only real answers are cached — never UNREACHABLE, so an outage or an
+    exhausted quota can't get pinned as a stored verdict."""
+    if status == UNREACHABLE:
+        return
+    with _cache_lock:
+        cache = _cache_load()
+        cache[_cache_key(ticker, asset_type)] = {
+            "status": status, "detail": detail, "metadata": metadata, "ts": time.time(),
+        }
+        try:
+            os.makedirs(os.path.dirname(HALAL_TERMINAL_CACHE_PATH), exist_ok=True)
+            tmp = f"{HALAL_TERMINAL_CACHE_PATH}.tmp"
+            with open(tmp, "w") as f:
+                json.dump(cache, f)
+            os.replace(tmp, HALAL_TERMINAL_CACHE_PATH)
+        except OSError as e:
+            print(f"Note: couldn't write Halal Terminal cache: {e}", file=sys.stderr)
+
+
 def check_halal_terminal(ticker, asset_type="stock"):
     """api.halalterminal.com — real JSON API (not a scrape), screening
     against AAOIFI/DJIM/FTSE/MSCI/S&P simultaneously. Only called when
@@ -206,6 +272,10 @@ def check_halal_terminal(ticker, asset_type="stock"):
         url = f"https://api.halalterminal.com/api/screen/{ticker}"
     if not HALAL_TERMINAL_API_KEY:
         return UNREACHABLE, url, "HALAL_TERMINAL_API_KEY not set — skipped", {}
+    cached = _cache_get(ticker, asset_type)
+    if cached:
+        status, detail, metadata = cached
+        return status, url, f"{detail} (cached)", metadata
     if os.environ.get("DRY_RUN") == "1":
         # The free tier is a hard 500-token monthly cap, not a per-day
         # allowance — a handful of manual dry runs during development can
@@ -239,24 +309,31 @@ def check_halal_terminal(ticker, asset_type="stock"):
     # populated then, so fall back to it before giving up as UNKNOWN.
     status = data.get("shariah_compliance_status")
     if status == "compliant":
-        return COMPLIANT, url, status, metadata
-    if status == "non_compliant":
-        return NON_COMPLIANT, url, status, metadata
-    is_compliant = data.get("is_compliant")
-    if is_compliant is True:
-        return COMPLIANT, url, "is_compliant=true", metadata
-    if is_compliant is False:
-        return NON_COMPLIANT, url, "is_compliant=false", metadata
-    return UNKNOWN, url, data.get("error_message") or status or "insufficient data", metadata
+        result = COMPLIANT, status
+    elif status == "non_compliant":
+        result = NON_COMPLIANT, status
+    elif data.get("is_compliant") is True:
+        result = COMPLIANT, "is_compliant=true"
+    elif data.get("is_compliant") is False:
+        result = NON_COMPLIANT, "is_compliant=false"
+    else:
+        result = UNKNOWN, data.get("error_message") or status or "insufficient data"
+    _cache_put(ticker, asset_type, result[0], result[1], metadata)
+    return result[0], url, result[1], metadata
 
 
 def check_compliance(ticker, asset_type="stock"):
-    checks = {"musaffa": check_musaffa}
-    if HALAL_TERMINAL_API_KEY:
-        checks["halal_terminal"] = check_halal_terminal
-    with ThreadPoolExecutor(max_workers=len(checks)) as pool:
-        futures = {name: pool.submit(fn, ticker, asset_type) for name, fn in checks.items()}
-        results = {name: future.result() for name, future in futures.items()}
+    """Musaffa is the primary source and decides first. Halal Terminal (quota
+    limited) is only a second layer of defence, consulted just for tickers
+    Musaffa reports COMPLIANT (and never for ETFs, see HALAL_TERMINAL_ETFS) — if Musaffa already says NON_COMPLIANT/UNKNOWN
+    the verdict can't become COMPLIANT, so the call would be wasted."""
+    results = {"musaffa": check_musaffa(ticker, asset_type)}
+    if (
+        HALAL_TERMINAL_API_KEY
+        and (asset_type != "etf" or HALAL_TERMINAL_ETFS)
+        and results["musaffa"][0] == COMPLIANT
+    ):
+        results["halal_terminal"] = check_halal_terminal(ticker, asset_type)
 
     # A source that was UNREACHABLE (down, unauthorized, out of quota, or
     # skipped) never got to render an opinion, so it's excluded from the
